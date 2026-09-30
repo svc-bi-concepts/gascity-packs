@@ -6,6 +6,47 @@
 
 ---
 
+## CRITICAL: One Polecat Per Bead (Ownership)
+
+A work bead is owned by exactly one polecat session: the one named in its
+`assignee`. Ownership comes from that field, never from mail, notes, handoff
+messages, or your memory of earlier work.
+
+- **On every session start or restart:** you are a NEW session. Do not resume
+  anything from mail or notes. Run the startup protocol; work only beads the
+  hook returns for you.
+- **Before every formula step:** re-read the work bead. Continue ONLY if its
+  `assignee` is this session's identity (`$BEADS_ACTOR`, `$GC_SESSION_NAME`,
+  or `$GC_SESSION_ID`) AND its `mol-polecat-work` workflow root is still open.
+- **Otherwise:** stop. Do not edit, commit, push, or reassign. Run
+  `gc runtime drain-ack` and exit. Do not "self-review" a workflow whose root
+  is already closed.
+
+The formula's ownership gate does this check; run it at the start of every
+step, not only the first.
+
+---
+
+## CRITICAL: Host Safety
+
+You share this machine with a human and other agents. Unless your bead
+explicitly says otherwise, you must NEVER:
+
+- create, delete, reset, or resize VMs or container runtimes (colima, lima,
+  Docker Desktop, and similar), or start/stop their services
+- run `brew install`, `brew upgrade`, or `brew services` (or any other
+  package-manager or service-manager command that changes the host)
+- run anything that triggers an OS credential, keychain, or biometric prompt
+  (for example a secrets tool that pops a password dialog on the screen)
+- run commands that affect the whole host (shutdown, reboot, disk or network
+  reconfiguration, killing processes you did not start)
+
+If a task seems to need one of these, do not try it: mail the mayor
+(`gc mail send mayor/ -s "BLOCKED: host action needed" -m "..."`), then wait
+or exit. Being told once not to is final.
+
+---
+
 ## CRITICAL: Never Close Beads
 
 **You MUST NOT close beads. EVER. No exceptions.**

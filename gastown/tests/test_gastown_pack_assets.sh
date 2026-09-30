@@ -229,6 +229,70 @@ test_polecat_exits_cleanly_when_work_is_already_shipped() {
         fail "polecat prompt should document the already-shipped clean exit"
 }
 
+test_polecat_enforces_ownership_and_host_safety() {
+    local formula prompt witness gate tmp
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    witness="$GASTOWN/agents/witness/prompt.template.md"
+
+    parse_toml "$formula"
+    # load-context, workspace-setup, self-review, submit-and-exit each carry the gate.
+    [[ $(grep -c '# BEGIN ownership-gate' "$formula") -eq 4 ]] ||
+        fail "ownership gate should be in load-context, workspace-setup, self-review and submit-and-exit"
+    grep -F 'id = "load-context"' "$formula" >/dev/null ||
+        fail "polecat formula should override load-context with the ownership gate"
+    grep -F 'Mail can describe work but never grants it' "$formula" >/dev/null ||
+        fail "load-context should not treat mail as authority to resume"
+    grep -F 'One Polecat Per Bead' "$prompt" >/dev/null ||
+        fail "polecat prompt should document ownership re-checks"
+    grep -F 'Host Safety' "$prompt" >/dev/null ||
+        fail "polecat prompt should have a Host Safety section"
+    grep -F 'Host Safety' "$witness" >/dev/null ||
+        fail "witness prompt should have a Host Safety section"
+    grep -F 'brew services' "$prompt" >/dev/null ||
+        fail "host safety should forbid package/service manager commands"
+
+    # Simulate the gate with a stub gc against varied bead states.
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+    python3 - "$formula" "$tmp/gate.sh" <<'PY'
+import sys, tomllib
+data = tomllib.load(open(sys.argv[1], "rb"))
+step = next(s for s in data["steps"] if s["id"] == "load-context")
+body = step["description"]
+start = body.index("# BEGIN ownership-gate")
+end = body.index("# END ownership-gate")
+open(sys.argv[2], "w").write(body[start:end].replace("{{convoy_id}}", "cv-1"))
+PY
+    cat >"$tmp/gc" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+    "convoy status") echo '{"children":[{"id":"wb-1"}]}' ;;
+    "bd show") cat "$STUB_WORK" ;;
+    "bd list") cat "$STUB_ROOTS" ;;
+    "runtime drain-ack") echo drained >>"$STUB_LOG" ;;
+esac
+STUB
+    chmod +x "$tmp/gc"
+
+    run_gate() { # assignee status roots-json -> exit code
+        printf '[{"assignee":"%s","status":"%s","metadata":{}}]' "$1" "$2" >"$tmp/work.json"
+        printf '%s' "$3" >"$tmp/roots.json"
+        : >"$tmp/log"
+        env -i PATH="$tmp:$PATH" BEADS_ACTOR=me STUB_WORK="$tmp/work.json" \
+            STUB_ROOTS="$tmp/roots.json" STUB_LOG="$tmp/log" \
+            bash "$tmp/gate.sh" >/dev/null 2>&1
+    }
+    local open_root='[{"id":"r1","metadata":{"gc.formula_name":"mol-polecat-work"}}]'
+
+    run_gate me in_progress "$open_root" || fail "gate should pass for the assignee with an open root"
+    if run_gate other in_progress "$open_root"; then fail "gate should stop a session that is not the assignee"; fi
+    grep -F drained "$tmp/log" >/dev/null || fail "gate should drain-ack when ownership is lost"
+    if run_gate "" open "$open_root"; then fail "gate should stop when the bead is unassigned"; fi
+    if run_gate me in_progress '[]'; then fail "gate should stop when the workflow root is closed"; fi
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -237,5 +301,7 @@ test_composition_is_documented
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_refinery_closes_attached_polecat_workflows_on_terminal_handoff
 test_polecat_exits_cleanly_when_work_is_already_shipped
+
+test_polecat_enforces_ownership_and_host_safety
 
 echo "gastown pack asset tests passed"
