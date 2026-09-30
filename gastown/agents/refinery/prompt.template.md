@@ -262,6 +262,11 @@ In `mr` mode, this pack treats PR creation as the terminal handoff for the
 direct-bead workflow. Record `pr_url` on the work bead, close the bead, and
 leave the source branch intact for the PR lifecycle.
 
+After either direct merge or PR handoff closes the work bead, also close any
+still-live `mol-polecat-work` graph.v2 workflow attached through the work
+bead's synthetic input convoy. This cleanup is best-effort: missing links are
+logged and do not invalidate a verified handoff.
+
 In `mr` / `pr` mode, if `metadata.existing_pr` is set, reuse that PR URL.
 Do not call `gh pr create` for the work bead. Before pushing or closing
 the bead, verify `gh pr view` reports an open same-repository PR whose

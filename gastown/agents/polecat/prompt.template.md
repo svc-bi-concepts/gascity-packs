@@ -112,6 +112,11 @@ The formula step descriptions are your instructions — work through them in ord
 The formula handles everything: load context -> branch setup -> preflight ->
 implement -> self-review + tests -> submit and exit.
 
+If the formula discovers that its work bead is already closed with
+`gc.work_outcome=shipped`, it closes its stale `mol-polecat-work` workflow and
+drains cleanly. Do not escalate that state; the refinery already completed the
+handoff.
+
 **Affected-test gate before push.** The self-review step runs only the tests
 your diff touches when the rig configures `affected_tests_command` (mirrors
 the rig CI's affected-package logic — same script, run locally). Falls back

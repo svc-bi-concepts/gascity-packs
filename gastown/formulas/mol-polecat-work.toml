@@ -88,15 +88,37 @@ if [ -z "$WORK_BEAD_ID" ]; then
   gc runtime drain-ack
   exit 1
 fi
-
-WORK_BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
-WORK_STATUS=$(printf '%s' "$WORK_BEAD_JSON" | jq -r '.[0].status // empty')
-WORK_OUTCOME=$(printf '%s' "$WORK_BEAD_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
+WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty')
+WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
-  echo "Work bead $WORK_BEAD_ID is already closed with gc.work_outcome=shipped."
-  echo "Closing this stale polecat workflow molecule without escalation."
-  gc workflow delete-source "$WORK_BEAD_ID" --apply || \
-    echo "No live workflow molecule remained for $WORK_BEAD_ID, or cleanup already happened."
+  echo "Work bead $WORK_BEAD_ID is already closed with gc.work_outcome=shipped; closing stale mol-polecat-work workflow."
+  CURRENT_ROOT=$(gc bd list \
+    --metadata-field "gc.input_convoy_id={{convoy_id}}" \
+    --metadata-field "gc.kind=workflow" \
+    --status=open,in_progress \
+    --json --limit=0 \
+    | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work" and .metadata["gc.formula_contract"] == "graph.v2") | .id' \
+    | head -n 1)
+  if [ -n "$CURRENT_ROOT" ]; then
+    for _ in 1 2 3 4 5; do
+      STEP_IDS=$(gc bd list \
+        --metadata-field "gc.root_bead_id=$CURRENT_ROOT" \
+        --status=open,in_progress \
+        --json --limit=0 \
+        | jq -r --arg root "$CURRENT_ROOT" '.[] | select(.id != $root) | .id' || true)
+      [ -n "$STEP_IDS" ] || break
+      CLOSED_ANY=0
+      for STEP_ID in $STEP_IDS; do
+        [ -n "$STEP_ID" ] || continue
+        if gc bd close "$STEP_ID" --reason "Work bead $WORK_BEAD_ID already shipped; closing stale polecat workflow step" >/dev/null 2>&1; then
+          CLOSED_ANY=1
+        fi
+      done
+      [ "$CLOSED_ANY" = "0" ] && break
+    done
+    gc bd close "$CURRENT_ROOT" --reason "Work bead $WORK_BEAD_ID already shipped; closing stale polecat workflow root" >/dev/null 2>&1 || true
+  fi
   gc runtime drain-ack
   exit 0
 fi
