@@ -11,7 +11,8 @@ merge review.
 1. Receive work (molecule poured with this formula, assigned to you)
 2. Follow steps in order (read descriptions, execute, move to next)
 3. Submit: push branch, set metadata on work bead, assign to refinery, exit
-4. You are GONE — Refinery merges, closes the bead
+4. You are GONE — Refinery merges or opens the PR, closes the bead, and closes
+   the attached polecat molecule
 
 **No MR beads.** Work beads flow directly: pool → polecat → refinery → closed.
 The polecat sets `metadata.branch` and `metadata.target` on the work bead
@@ -20,6 +21,10 @@ and reassigns it to the refinery. The refinery merges and closes.
 **NEVER CLOSE BEADS.** You must not run `bd close` or set status=closed.
 Even if you believe the code is already merged, reassign to refinery —
 only the refinery verifies merges and closes beads.
+Exception: if this molecule resumes after the refinery has already closed
+the work bead with `gc.work_outcome=shipped`, close this molecule's workflow
+subtree with `gc workflow delete-source "$WORK_BEAD_ID" --apply`, drain, and
+exit cleanly. Do not reopen, reassign, or escalate the already-shipped work.
 `{{base_branch}}` may come from the work bead's own `metadata.target` or
 be inherited from a parent convoy with `metadata.target` set.
 
@@ -82,6 +87,18 @@ if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-polecat-work requires an input convoy with exactly one tracked member" >&2
   gc runtime drain-ack
   exit 1
+fi
+
+WORK_BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+WORK_STATUS=$(printf '%s' "$WORK_BEAD_JSON" | jq -r '.[0].status // empty')
+WORK_OUTCOME=$(printf '%s' "$WORK_BEAD_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
+if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
+  echo "Work bead $WORK_BEAD_ID is already closed with gc.work_outcome=shipped."
+  echo "Closing this stale polecat workflow molecule without escalation."
+  gc workflow delete-source "$WORK_BEAD_ID" --apply || \
+    echo "No live workflow molecule remained for $WORK_BEAD_ID, or cleanup already happened."
+  gc runtime drain-ack
+  exit 0
 fi
 ```
 
