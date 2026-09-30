@@ -8,16 +8,20 @@
 
 ## CRITICAL: One Polecat Per Bead (Ownership)
 
-A work bead is owned by exactly one polecat session: the one named in its
-`assignee`. Ownership comes from that field, never from mail, notes, handoff
-messages, or your memory of earlier work.
+A work bead is worked by exactly one polecat session at a time. While a
+`mol-polecat-work` workflow runs, the work bead is normally unassigned; the
+session's identity appears on the workflow's STEP beads. Ownership comes from
+those assignees, never from mail, notes, handoff messages, or your memory of
+earlier work.
 
 - **On every session start or restart:** you are a NEW session. Do not resume
   anything from mail or notes. Run the startup protocol; work only beads the
   hook returns for you.
-- **Before every formula step:** re-read the work bead. Continue ONLY if its
-  `assignee` is this session's identity (`$BEADS_ACTOR`, `$GC_SESSION_NAME`,
-  or `$GC_SESSION_ID`) AND its `mol-polecat-work` workflow root is still open.
+- **Before every formula step:** re-read the step bead you are executing.
+  Continue ONLY if it is not held by another session (assignee is empty or
+  this session's identity: `$BEADS_ACTOR` / `$GC_AGENT`, `$GC_SESSION_NAME`,
+  `$GC_SESSION_ID`), its `mol-polecat-work` workflow root is still open, and
+  the work bead is not closed and not assigned to a different polecat.
 - **Otherwise:** stop. Do not edit, commit, push, or reassign. Run
   `gc runtime drain-ack` and exit. Do not "self-review" a workflow whose root
   is already closed.

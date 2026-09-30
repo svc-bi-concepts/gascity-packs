@@ -19,8 +19,9 @@ The polecat sets `metadata.branch` and `metadata.target` on the work bead
 and reassigns it to the refinery. The refinery merges and closes.
 
 **ONE POLECAT PER BEAD.** Every step starts with the ownership gate: re-read
-the work bead and continue only if its assignee is this session and its
-workflow root is open. Otherwise stop, do not push, and exit. A session that
+the step bead you are executing and continue only if it is not held by another
+session, its workflow root is open, and the work bead is not closed or assigned
+to a different polecat. Otherwise stop, do not push, and exit. A session that
 restarted never resumes from mail or notes alone.
 
 **NEVER CLOSE BEADS.** You must not run `bd close` or set status=closed.
@@ -79,11 +80,20 @@ else, so a restarted or duplicate session cannot work a bead it does not hold.
 
 ```bash
 # BEGIN ownership-gate
+OWNERSHIP_STEP=load-context
+OWNERSHIP_ALLOW_SHIPPED=1
 ownership_stop() {
   echo "OWNERSHIP GATE: $1" >&2
   echo "This is not your work. Do NOT edit, commit, push, or reassign. Exiting." >&2
   gc runtime drain-ack
   exit 1
+}
+is_me() {
+  local me
+  for me in "${BEADS_ACTOR:-}" "${GC_AGENT:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
+    [ -n "$me" ] && [ "$me" = "$1" ] && return 0
+  done
+  return 1
 }
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json) || ownership_stop "cannot read input convoy {{convoy_id}}"
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
@@ -92,26 +102,36 @@ WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || ownership_stop "cannot re-read
 WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty')
 WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
-if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
-  echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
-else
-  OWNER_OK=0
-  if [ -n "${BEADS_ACTOR:-}${GC_SESSION_NAME:-}${GC_SESSION_ID:-}" ]; then
-    for ME in "${BEADS_ACTOR:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
-      [ -n "$ME" ] && [ "$ME" = "$WORK_ASSIGNEE" ] && OWNER_OK=1
-    done
-  elif [ -n "${GC_AGENT:-}" ] && [ "$GC_AGENT" = "$WORK_ASSIGNEE" ]; then
-    OWNER_OK=1
+if [ "$WORK_STATUS" = "closed" ]; then
+  if [ "$WORK_OUTCOME" = "shipped" ] && [ "$OWNERSHIP_ALLOW_SHIPPED" = "1" ]; then
+    echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
+  else
+    ownership_stop "work bead $WORK_BEAD_ID is already closed"
   fi
-  [ "$OWNER_OK" = "1" ] || ownership_stop "work bead $WORK_BEAD_ID is assigned to '${WORK_ASSIGNEE:-nobody}', not to this session"
-  ROOT_OPEN=$(gc bd list \
+else
+  # The workflow root for this convoy must still be open.
+  ROOT_ID=$(gc bd list \
     --metadata-field "gc.input_convoy_id={{convoy_id}}" \
     --metadata-field "gc.kind=workflow" \
     --status=open,in_progress \
     --json --limit=0 \
     | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work") | .id' \
     | head -n 1)
-  [ -n "$ROOT_OPEN" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  [ -n "$ROOT_ID" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  # The work bead is normally unassigned while the workflow runs; only a
+  # DIFFERENT owner is a mismatch.
+  if [ -n "$WORK_ASSIGNEE" ] && ! is_me "$WORK_ASSIGNEE"; then
+    ownership_stop "work bead $WORK_BEAD_ID is assigned to '$WORK_ASSIGNEE', not to this session"
+  fi
+  # The step bead being executed carries the polecat identity once claimed.
+  # Unassigned (or not found) is not a mismatch; another owner is.
+  STEP_ASSIGNEE=$(gc bd list \
+    --metadata-field "gc.root_bead_id=$ROOT_ID" \
+    --json --limit=0 2>/dev/null \
+    | jq -r --arg s "$OWNERSHIP_STEP" '[.[] | select((.metadata["gc.step_id"] // "") | (. == $s or endswith("." + $s)))] | .[0].assignee // empty' 2>/dev/null) || STEP_ASSIGNEE=""
+  if [ -n "$STEP_ASSIGNEE" ] && ! is_me "$STEP_ASSIGNEE"; then
+    ownership_stop "step $OWNERSHIP_STEP of workflow $ROOT_ID is assigned to '$STEP_ASSIGNEE', not to this session"
+  fi
 fi
 # END ownership-gate
 ```
@@ -149,7 +169,7 @@ gc mail inbox
 # Read any HANDOFF or assignment messages, then archive after absorbing context
 # gc mail read <id> → process → gc mail archive <id>
 ```
-Mail can describe work but never grants it. Only the bead assignee does.
+Mail can describe work but never grants it. Only the bead assignees do.
 
 **6. Understand the requirements:**
 - What exactly needs to be done?
@@ -184,18 +204,28 @@ Every check is idempotent — safe to re-run after crash/restart.
 3. the rig repo's default branch
 
 **Ownership gate (run FIRST, in every step, and again after any restart).**
-Re-read the work bead and continue ONLY if its assignee is this session and
-its workflow root is still open. Never resume from mail, notes, or memory of
-an earlier session: ownership comes from the bead assignee alone. If the gate
-stops you, do not push and do not reassign; it drains and exits.
+Re-read the step bead you are executing and continue ONLY if it is not held
+by another session, its workflow root is still open, and the work bead is not
+closed or assigned to a different polecat. Never resume from mail, notes, or
+memory of an earlier session: ownership comes from the bead assignees alone.
+If the gate stops you, do not push and do not reassign; it drains and exits.
 
 ```bash
 # BEGIN ownership-gate
+OWNERSHIP_STEP=workspace-setup
+OWNERSHIP_ALLOW_SHIPPED=1
 ownership_stop() {
   echo "OWNERSHIP GATE: $1" >&2
   echo "This is not your work. Do NOT edit, commit, push, or reassign. Exiting." >&2
   gc runtime drain-ack
   exit 1
+}
+is_me() {
+  local me
+  for me in "${BEADS_ACTOR:-}" "${GC_AGENT:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
+    [ -n "$me" ] && [ "$me" = "$1" ] && return 0
+  done
+  return 1
 }
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json) || ownership_stop "cannot read input convoy {{convoy_id}}"
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
@@ -204,26 +234,36 @@ WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || ownership_stop "cannot re-read
 WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty')
 WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
-if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
-  echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
-else
-  OWNER_OK=0
-  if [ -n "${BEADS_ACTOR:-}${GC_SESSION_NAME:-}${GC_SESSION_ID:-}" ]; then
-    for ME in "${BEADS_ACTOR:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
-      [ -n "$ME" ] && [ "$ME" = "$WORK_ASSIGNEE" ] && OWNER_OK=1
-    done
-  elif [ -n "${GC_AGENT:-}" ] && [ "$GC_AGENT" = "$WORK_ASSIGNEE" ]; then
-    OWNER_OK=1
+if [ "$WORK_STATUS" = "closed" ]; then
+  if [ "$WORK_OUTCOME" = "shipped" ] && [ "$OWNERSHIP_ALLOW_SHIPPED" = "1" ]; then
+    echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
+  else
+    ownership_stop "work bead $WORK_BEAD_ID is already closed"
   fi
-  [ "$OWNER_OK" = "1" ] || ownership_stop "work bead $WORK_BEAD_ID is assigned to '${WORK_ASSIGNEE:-nobody}', not to this session"
-  ROOT_OPEN=$(gc bd list \
+else
+  # The workflow root for this convoy must still be open.
+  ROOT_ID=$(gc bd list \
     --metadata-field "gc.input_convoy_id={{convoy_id}}" \
     --metadata-field "gc.kind=workflow" \
     --status=open,in_progress \
     --json --limit=0 \
     | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work") | .id' \
     | head -n 1)
-  [ -n "$ROOT_OPEN" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  [ -n "$ROOT_ID" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  # The work bead is normally unassigned while the workflow runs; only a
+  # DIFFERENT owner is a mismatch.
+  if [ -n "$WORK_ASSIGNEE" ] && ! is_me "$WORK_ASSIGNEE"; then
+    ownership_stop "work bead $WORK_BEAD_ID is assigned to '$WORK_ASSIGNEE', not to this session"
+  fi
+  # The step bead being executed carries the polecat identity once claimed.
+  # Unassigned (or not found) is not a mismatch; another owner is.
+  STEP_ASSIGNEE=$(gc bd list \
+    --metadata-field "gc.root_bead_id=$ROOT_ID" \
+    --json --limit=0 2>/dev/null \
+    | jq -r --arg s "$OWNERSHIP_STEP" '[.[] | select((.metadata["gc.step_id"] // "") | (. == $s or endswith("." + $s)))] | .[0].assignee // empty' 2>/dev/null) || STEP_ASSIGNEE=""
+  if [ -n "$STEP_ASSIGNEE" ] && ! is_me "$STEP_ASSIGNEE"; then
+    ownership_stop "step $OWNERSHIP_STEP of workflow $ROOT_ID is assigned to '$STEP_ASSIGNEE', not to this session"
+  fi
 fi
 # END ownership-gate
 ```
@@ -396,18 +436,28 @@ locally-runnable failures should have been caught before push.
 **Config: affected_tests_command = {{affected_tests_command}}**
 
 **Ownership gate (run FIRST, in every step, and again after any restart).**
-Re-read the work bead and continue ONLY if its assignee is this session and
-its workflow root is still open. Never resume from mail, notes, or memory of
-an earlier session: ownership comes from the bead assignee alone. If the gate
-stops you, do not push and do not reassign; it drains and exits.
+Re-read the step bead you are executing and continue ONLY if it is not held
+by another session, its workflow root is still open, and the work bead is not
+closed or assigned to a different polecat. Never resume from mail, notes, or
+memory of an earlier session: ownership comes from the bead assignees alone.
+If the gate stops you, do not push and do not reassign; it drains and exits.
 
 ```bash
 # BEGIN ownership-gate
+OWNERSHIP_STEP=self-review
+OWNERSHIP_ALLOW_SHIPPED=0
 ownership_stop() {
   echo "OWNERSHIP GATE: $1" >&2
   echo "This is not your work. Do NOT edit, commit, push, or reassign. Exiting." >&2
   gc runtime drain-ack
   exit 1
+}
+is_me() {
+  local me
+  for me in "${BEADS_ACTOR:-}" "${GC_AGENT:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
+    [ -n "$me" ] && [ "$me" = "$1" ] && return 0
+  done
+  return 1
 }
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json) || ownership_stop "cannot read input convoy {{convoy_id}}"
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
@@ -416,26 +466,36 @@ WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || ownership_stop "cannot re-read
 WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty')
 WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
-if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
-  echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
-else
-  OWNER_OK=0
-  if [ -n "${BEADS_ACTOR:-}${GC_SESSION_NAME:-}${GC_SESSION_ID:-}" ]; then
-    for ME in "${BEADS_ACTOR:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
-      [ -n "$ME" ] && [ "$ME" = "$WORK_ASSIGNEE" ] && OWNER_OK=1
-    done
-  elif [ -n "${GC_AGENT:-}" ] && [ "$GC_AGENT" = "$WORK_ASSIGNEE" ]; then
-    OWNER_OK=1
+if [ "$WORK_STATUS" = "closed" ]; then
+  if [ "$WORK_OUTCOME" = "shipped" ] && [ "$OWNERSHIP_ALLOW_SHIPPED" = "1" ]; then
+    echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
+  else
+    ownership_stop "work bead $WORK_BEAD_ID is already closed"
   fi
-  [ "$OWNER_OK" = "1" ] || ownership_stop "work bead $WORK_BEAD_ID is assigned to '${WORK_ASSIGNEE:-nobody}', not to this session"
-  ROOT_OPEN=$(gc bd list \
+else
+  # The workflow root for this convoy must still be open.
+  ROOT_ID=$(gc bd list \
     --metadata-field "gc.input_convoy_id={{convoy_id}}" \
     --metadata-field "gc.kind=workflow" \
     --status=open,in_progress \
     --json --limit=0 \
     | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work") | .id' \
     | head -n 1)
-  [ -n "$ROOT_OPEN" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  [ -n "$ROOT_ID" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  # The work bead is normally unassigned while the workflow runs; only a
+  # DIFFERENT owner is a mismatch.
+  if [ -n "$WORK_ASSIGNEE" ] && ! is_me "$WORK_ASSIGNEE"; then
+    ownership_stop "work bead $WORK_BEAD_ID is assigned to '$WORK_ASSIGNEE', not to this session"
+  fi
+  # The step bead being executed carries the polecat identity once claimed.
+  # Unassigned (or not found) is not a mismatch; another owner is.
+  STEP_ASSIGNEE=$(gc bd list \
+    --metadata-field "gc.root_bead_id=$ROOT_ID" \
+    --json --limit=0 2>/dev/null \
+    | jq -r --arg s "$OWNERSHIP_STEP" '[.[] | select((.metadata["gc.step_id"] // "") | (. == $s or endswith("." + $s)))] | .[0].assignee // empty' 2>/dev/null) || STEP_ASSIGNEE=""
+  if [ -n "$STEP_ASSIGNEE" ] && ! is_me "$STEP_ASSIGNEE"; then
+    ownership_stop "step $OWNERSHIP_STEP of workflow $ROOT_ID is assigned to '$STEP_ASSIGNEE', not to this session"
+  fi
 fi
 # END ownership-gate
 ```
@@ -513,18 +573,28 @@ description = """
 Hand off your work and self-clean. You cease to exist after this step.
 
 **Ownership gate (run FIRST, in every step, and again after any restart).**
-Re-read the work bead and continue ONLY if its assignee is this session and
-its workflow root is still open. Never resume from mail, notes, or memory of
-an earlier session: ownership comes from the bead assignee alone. If the gate
-stops you, do not push and do not reassign; it drains and exits.
+Re-read the step bead you are executing and continue ONLY if it is not held
+by another session, its workflow root is still open, and the work bead is not
+closed or assigned to a different polecat. Never resume from mail, notes, or
+memory of an earlier session: ownership comes from the bead assignees alone.
+If the gate stops you, do not push and do not reassign; it drains and exits.
 
 ```bash
 # BEGIN ownership-gate
+OWNERSHIP_STEP=submit-and-exit
+OWNERSHIP_ALLOW_SHIPPED=0
 ownership_stop() {
   echo "OWNERSHIP GATE: $1" >&2
   echo "This is not your work. Do NOT edit, commit, push, or reassign. Exiting." >&2
   gc runtime drain-ack
   exit 1
+}
+is_me() {
+  local me
+  for me in "${BEADS_ACTOR:-}" "${GC_AGENT:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
+    [ -n "$me" ] && [ "$me" = "$1" ] && return 0
+  done
+  return 1
 }
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json) || ownership_stop "cannot read input convoy {{convoy_id}}"
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
@@ -533,26 +603,36 @@ WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || ownership_stop "cannot re-read
 WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty')
 WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty')
-if [ "$WORK_STATUS" = "closed" ] && [ "$WORK_OUTCOME" = "shipped" ]; then
-  echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
-else
-  OWNER_OK=0
-  if [ -n "${BEADS_ACTOR:-}${GC_SESSION_NAME:-}${GC_SESSION_ID:-}" ]; then
-    for ME in "${BEADS_ACTOR:-}" "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}"; do
-      [ -n "$ME" ] && [ "$ME" = "$WORK_ASSIGNEE" ] && OWNER_OK=1
-    done
-  elif [ -n "${GC_AGENT:-}" ] && [ "$GC_AGENT" = "$WORK_ASSIGNEE" ]; then
-    OWNER_OK=1
+if [ "$WORK_STATUS" = "closed" ]; then
+  if [ "$WORK_OUTCOME" = "shipped" ] && [ "$OWNERSHIP_ALLOW_SHIPPED" = "1" ]; then
+    echo "Work bead $WORK_BEAD_ID already shipped; stale-workflow cleanup handles this."
+  else
+    ownership_stop "work bead $WORK_BEAD_ID is already closed"
   fi
-  [ "$OWNER_OK" = "1" ] || ownership_stop "work bead $WORK_BEAD_ID is assigned to '${WORK_ASSIGNEE:-nobody}', not to this session"
-  ROOT_OPEN=$(gc bd list \
+else
+  # The workflow root for this convoy must still be open.
+  ROOT_ID=$(gc bd list \
     --metadata-field "gc.input_convoy_id={{convoy_id}}" \
     --metadata-field "gc.kind=workflow" \
     --status=open,in_progress \
     --json --limit=0 \
     | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work") | .id' \
     | head -n 1)
-  [ -n "$ROOT_OPEN" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  [ -n "$ROOT_ID" ] || ownership_stop "the mol-polecat-work workflow for convoy {{convoy_id}} is closed"
+  # The work bead is normally unassigned while the workflow runs; only a
+  # DIFFERENT owner is a mismatch.
+  if [ -n "$WORK_ASSIGNEE" ] && ! is_me "$WORK_ASSIGNEE"; then
+    ownership_stop "work bead $WORK_BEAD_ID is assigned to '$WORK_ASSIGNEE', not to this session"
+  fi
+  # The step bead being executed carries the polecat identity once claimed.
+  # Unassigned (or not found) is not a mismatch; another owner is.
+  STEP_ASSIGNEE=$(gc bd list \
+    --metadata-field "gc.root_bead_id=$ROOT_ID" \
+    --json --limit=0 2>/dev/null \
+    | jq -r --arg s "$OWNERSHIP_STEP" '[.[] | select((.metadata["gc.step_id"] // "") | (. == $s or endswith("." + $s)))] | .[0].assignee // empty' 2>/dev/null) || STEP_ASSIGNEE=""
+  if [ -n "$STEP_ASSIGNEE" ] && ! is_me "$STEP_ASSIGNEE"; then
+    ownership_stop "step $OWNERSHIP_STEP of workflow $ROOT_ID is assigned to '$STEP_ASSIGNEE', not to this session"
+  fi
 fi
 # END ownership-gate
 ```

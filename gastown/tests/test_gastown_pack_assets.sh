@@ -256,41 +256,80 @@ test_polecat_enforces_ownership_and_host_safety() {
     tmp=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
-    python3 - "$formula" "$tmp/gate.sh" <<'PY'
+    python3 - "$formula" "$tmp" <<'PY'
 import sys, tomllib
 data = tomllib.load(open(sys.argv[1], "rb"))
-step = next(s for s in data["steps"] if s["id"] == "load-context")
-body = step["description"]
-start = body.index("# BEGIN ownership-gate")
-end = body.index("# END ownership-gate")
-open(sys.argv[2], "w").write(body[start:end].replace("{{convoy_id}}", "cv-1"))
+for step in data["steps"]:
+    body = step["description"]
+    if "# BEGIN ownership-gate" not in body:
+        continue
+    start = body.index("# BEGIN ownership-gate")
+    end = body.index("# END ownership-gate")
+    open(f"{sys.argv[2]}/gate-{step['id']}.sh", "w").write(
+        body[start:end].replace("{{convoy_id}}", "cv-1"))
 PY
     cat >"$tmp/gc" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
     "convoy status") echo '{"children":[{"id":"wb-1"}]}' ;;
     "bd show") cat "$STUB_WORK" ;;
-    "bd list") cat "$STUB_ROOTS" ;;
+    "bd list")
+        case "$*" in
+            *gc.kind=workflow*) cat "$STUB_ROOTS" ;;
+            *gc.root_bead_id=*) cat "$STUB_STEPS" ;;
+        esac ;;
     "runtime drain-ack") echo drained >>"$STUB_LOG" ;;
 esac
 STUB
     chmod +x "$tmp/gc"
 
-    run_gate() { # assignee status roots-json -> exit code
-        printf '[{"assignee":"%s","status":"%s","metadata":{}}]' "$1" "$2" >"$tmp/work.json"
-        printf '%s' "$3" >"$tmp/roots.json"
+    # gate step work-assignee work-status work-outcome roots-json steps-json
+    run_gate() {
+        printf '[{"assignee":"%s","status":"%s","metadata":{"gc.work_outcome":"%s"}}]' \
+            "$2" "$3" "$4" >"$tmp/work.json"
+        printf '%s' "$5" >"$tmp/roots.json"
+        printf '%s' "$6" >"$tmp/steps.json"
         : >"$tmp/log"
-        env -i PATH="$tmp:$PATH" BEADS_ACTOR=me STUB_WORK="$tmp/work.json" \
-            STUB_ROOTS="$tmp/roots.json" STUB_LOG="$tmp/log" \
-            bash "$tmp/gate.sh" >/dev/null 2>&1
+        env -i PATH="$tmp:$PATH" BEADS_ACTOR=rig/gastown.me GC_AGENT=rig/gastown.me \
+            STUB_WORK="$tmp/work.json" STUB_ROOTS="$tmp/roots.json" \
+            STUB_STEPS="$tmp/steps.json" STUB_LOG="$tmp/log" \
+            bash "$tmp/gate-$1.sh" >/dev/null 2>&1
     }
     local open_root='[{"id":"r1","metadata":{"gc.formula_name":"mol-polecat-work"}}]'
+    local step_me='[{"assignee":"rig/gastown.me","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
+    local step_other='[{"assignee":"rig/gastown.other","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
+    local step_none='[{"assignee":"","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
 
-    run_gate me in_progress "$open_root" || fail "gate should pass for the assignee with an open root"
-    if run_gate other in_progress "$open_root"; then fail "gate should stop a session that is not the assignee"; fi
+    # Live shape: work bead unassigned, current step assigned to this session -> pass.
+    run_gate workspace-setup "" open "" "$open_root" "$step_me" ||
+        fail "gate should pass: work bead unassigned, current step assigned to this session"
+    # Missing optional fields are not a mismatch.
+    run_gate workspace-setup "" open "" "$open_root" "$step_none" ||
+        fail "gate should pass when the current step is not yet assigned"
+    run_gate workspace-setup "" open "" "$open_root" '[]' ||
+        fail "gate should pass when the step bead cannot be found"
+    run_gate load-context "rig/gastown.me" in_progress "" "$open_root" "$step_me" ||
+        fail "gate should pass when the work bead is assigned to this session"
+    # Genuine mismatches stop and drain.
+    if run_gate workspace-setup "" open "" "$open_root" "$step_other"; then
+        fail "gate should stop when the current step is assigned to another polecat"
+    fi
     grep -F drained "$tmp/log" >/dev/null || fail "gate should drain-ack when ownership is lost"
-    if run_gate "" open "$open_root"; then fail "gate should stop when the bead is unassigned"; fi
-    if run_gate me in_progress '[]'; then fail "gate should stop when the workflow root is closed"; fi
+    if run_gate workspace-setup "" open "" '[]' "$step_me"; then
+        fail "gate should stop when the workflow root is closed"
+    fi
+    if run_gate workspace-setup "rig/gastown.other" open "" "$open_root" "$step_me"; then
+        fail "gate should stop when the work bead is assigned to a different polecat"
+    fi
+    if run_gate self-review "" closed "shipped" "$open_root" "$step_me"; then
+        fail "gate should stop self-review on a shipped work bead"
+    fi
+    if run_gate load-context "" closed "" "$open_root" "$step_me"; then
+        fail "gate should stop on a closed work bead that was not shipped"
+    fi
+    # load-context and workspace-setup let a shipped bead through to the stale-workflow cleanup.
+    run_gate workspace-setup "" closed "shipped" '[]' "$step_me" ||
+        fail "workspace-setup gate should defer shipped beads to stale-workflow cleanup"
 }
 
 test_dog_assets_are_pack_local
