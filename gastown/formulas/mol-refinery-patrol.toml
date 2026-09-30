@@ -27,6 +27,12 @@ In `mr` mode, refinery treats PR publication as the terminal handoff for
 the direct-bead workflow: it records the PR URL on the work bead and
 closes the bead once the PR is verified.
 
+After either terminal handoff, the refinery also closes any still-live
+workflow molecule sourced from that work bead. The cleanup is best-effort:
+the verified handoff remains authoritative, already-closed workflow beads
+are skipped by the workflow helper, and a missing workflow link is logged
+without failing the handoff.
+
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
 
@@ -729,6 +735,11 @@ gc bd update "$WORK" \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason && \
 gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"
+if gc workflow delete-source "$WORK" --apply; then
+  echo "Closed any live workflow molecule sourced from $WORK after handoff: Merged to $TARGET at $MERGED_SHORT"
+else
+  echo "Could not close workflow molecule sourced from $WORK after handoff; continuing." >&2
+fi
 ```
 
 If the script exits non-zero: STOP. Debug and retry. Do NOT write merge
@@ -979,6 +990,11 @@ gc bd update $WORK \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason && \
 gc bd close $WORK --reason "Pull request ready: $PR_URL"
+if gc workflow delete-source "$WORK" --apply; then
+  echo "Closed any live workflow molecule sourced from $WORK after handoff: Pull request ready: $PR_URL"
+else
+  echo "Could not close workflow molecule sourced from $WORK after handoff; continuing." >&2
+fi
 ```
 
 **5. Cleanup:**

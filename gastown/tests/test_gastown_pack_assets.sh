@@ -169,11 +169,65 @@ if verify >= metadata:
 PY
 }
 
+test_refinery_handoff_closes_attached_polecat_workflow() {
+    local formula direct_block mr_block
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+
+    [[ "$(grep -cF 'gc workflow delete-source "$WORK" --apply' "$formula")" -ge 2 ]] ||
+        fail "refinery should close workflows sourced from the handed-off work bead in both handoff paths"
+    grep -F 'continuing.' "$formula" >/dev/null ||
+        fail "refinery workflow cleanup should log and continue when the workflow link is missing"
+
+    direct_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "direct"')
+end = text.index('**If MERGE_STRATEGY = "mr"')
+print(text[start:end])
+PY
+)
+    mr_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "mr"')
+end = text.index('**If MERGE_STRATEGY = "local"')
+print(text[start:end])
+PY
+)
+
+    [[ "$direct_block" == *'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"'* ]] ||
+        fail "direct refinery handoff should still close the work bead"
+    [[ "$direct_block" == *'gc workflow delete-source "$WORK" --apply'* ]] ||
+        fail "direct refinery handoff should close the attached polecat workflow"
+    [[ "$mr_block" == *'gc bd close $WORK --reason "Pull request ready: $PR_URL"'* ]] ||
+        fail "PR refinery handoff should still close the work bead"
+    [[ "$mr_block" == *'gc workflow delete-source "$WORK" --apply'* ]] ||
+        fail "PR refinery handoff should close the attached polecat workflow"
+}
+
+test_polecat_stale_shipped_workflow_exits_cleanly() {
+    local formula
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+
+    grep -F 'gc.work_outcome=shipped' "$formula" >/dev/null ||
+        fail "polecat workflow should document stale shipped work handling"
+    grep -F 'WORK_STATUS=$(printf' "$formula" >/dev/null ||
+        fail "polecat workspace setup should inspect the work bead status"
+    grep -F 'WORK_OUTCOME=$(printf' "$formula" >/dev/null ||
+        fail "polecat workspace setup should inspect gc.work_outcome"
+    grep -F 'gc workflow delete-source "$WORK_BEAD_ID" --apply' "$formula" >/dev/null ||
+        fail "polecat stale shipped guard should close its sourced workflow molecule"
+    grep -F 'gc runtime drain-ack' "$formula" >/dev/null ||
+        fail "polecat stale shipped guard should drain after cleanup"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_refinery_handoff_closes_attached_polecat_workflow
+test_polecat_stale_shipped_workflow_exits_cleanly
 
 echo "gastown pack asset tests passed"
