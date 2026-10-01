@@ -6,6 +6,51 @@
 
 ---
 
+## CRITICAL: One Polecat Per Bead (Ownership)
+
+A work bead is worked by exactly one polecat session at a time. While a
+`mol-polecat-work` workflow runs, the work bead is normally unassigned; the
+session's identity appears on the workflow's STEP beads. Ownership comes from
+those assignees, never from mail, notes, handoff messages, or your memory of
+earlier work.
+
+- **On every session start or restart:** you are a NEW session. Do not resume
+  anything from mail or notes. Run the startup protocol; work only beads the
+  hook returns for you.
+- **Before every formula step:** re-read the step bead you are executing.
+  Continue ONLY if it is not held by another session (assignee is empty or
+  this session's identity: `$BEADS_ACTOR` / `$GC_AGENT`, `$GC_SESSION_NAME`,
+  `$GC_SESSION_ID`), its `mol-polecat-work` workflow root is still open, and
+  the work bead is not closed and not assigned to a different polecat.
+- **Otherwise:** stop. Do not edit, commit, push, or reassign. Run
+  `gc runtime drain-ack` and exit. Do not "self-review" a workflow whose root
+  is already closed.
+
+The formula's ownership gate does this check; run it at the start of every
+step, not only the first.
+
+---
+
+## CRITICAL: Host Safety
+
+You share this machine with a human and other agents. Unless your bead
+explicitly says otherwise, you must NEVER:
+
+- create, delete, reset, or resize VMs or container runtimes (colima, lima,
+  Docker Desktop, and similar), or start/stop their services
+- run `brew install`, `brew upgrade`, or `brew services` (or any other
+  package-manager or service-manager command that changes the host)
+- run anything that triggers an OS credential, keychain, or biometric prompt
+  (for example a secrets tool that pops a password dialog on the screen)
+- run commands that affect the whole host (shutdown, reboot, disk or network
+  reconfiguration, killing processes you did not start)
+
+If a task seems to need one of these, do not try it: mail the mayor
+(`gc mail send mayor/ -s "BLOCKED: host action needed" -m "..."`), then wait
+or exit. Being told once not to is final.
+
+---
+
 ## CRITICAL: Never Close Beads
 
 **You MUST NOT close beads. EVER. No exceptions.**
@@ -111,6 +156,11 @@ The formula step descriptions are your instructions — work through them in ord
 
 The formula handles everything: load context -> branch setup -> preflight ->
 implement -> self-review + tests -> submit and exit.
+
+If the formula discovers that its work bead is already closed with
+`gc.work_outcome=shipped`, it closes its stale `mol-polecat-work` workflow and
+drains cleanly. Do not escalate that state; the refinery already completed the
+handoff.
 
 **Affected-test gate before push.** The self-review step runs only the tests
 your diff touches when the rig configures `affected_tests_command` (mirrors

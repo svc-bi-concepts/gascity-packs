@@ -20,13 +20,18 @@ the work bead and assigns it to the refinery. On rejection, the
 refinery puts the bead back in the pool with rejection metadata.
 
 Merge strategy is per-work-bead metadata:
-- `mr` / `pr` (default): publish a GitHub pull request instead of landing
-  directly
-- `direct`: fast-forward merge to target and push
+- `direct` (default): fast-forward merge to target and push
+- `mr` / `pr`: publish a GitHub pull request instead of landing directly
 
 In `mr` mode, refinery treats PR publication as the terminal handoff for
 the direct-bead workflow: it records the PR URL on the work bead and
 closes the bead once the PR is verified.
+
+After either terminal handoff, the refinery also closes any still-live
+workflow molecule sourced from that work bead. The cleanup is best-effort:
+the verified handoff remains authoritative, already-closed workflow beads
+are skipped by the workflow helper, and a missing workflow link is logged
+without failing the handoff.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
@@ -394,11 +399,7 @@ Read the merge target and merge strategy from the work bead metadata:
 ```bash
 BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // empty')
-if [ -z "$MERGE_STRATEGY" ]; then
-  MERGE_STRATEGY="pr"
-  echo "No metadata.merge_strategy on $WORK; defaulting to merge_strategy=pr (pull-request handoff)."
-fi
+MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
 ORIGIN_REPO_ERROR=""
 if command -v gh >/dev/null 2>&1; then
@@ -520,6 +521,57 @@ halt_false_completion() {
   echo "STOP. Bead left blocked + escalated to mayor/witness. NEVER silent retry."
   gc runtime drain-ack
   exit 1
+}
+
+close_polecat_workflow_for_handoff() {
+  handoff_work="$1"
+  handoff_reason="$2"
+  refs_json=$(gc bd show "$handoff_work" --refs --json 2>/dev/null || true)
+  if [ -z "$refs_json" ]; then
+    echo "Could not inspect workflow refs for $handoff_work; continuing handoff."
+    return 0
+  fi
+
+  printf '%s\n' "$refs_json" \
+    | jq -r --arg work "$handoff_work" '.[$work][]? | select(.dependency_type == "tracks" and .issue_type == "convoy" and .metadata["gc.synthetic"] == "true") | .id' \
+    | while IFS= read -r input_convoy; do
+        [ -n "$input_convoy" ] || continue
+        roots_json=$(gc bd list \
+          --metadata-field "gc.input_convoy_id=$input_convoy" \
+          --metadata-field "gc.kind=workflow" \
+          --status=open,in_progress \
+          --json --limit=0 2>/dev/null || true)
+        [ -n "$roots_json" ] || continue
+        printf '%s\n' "$roots_json" \
+          | jq -r '.[] | select(.metadata["gc.formula_name"] == "mol-polecat-work" and .metadata["gc.formula_contract"] == "graph.v2") | .id' \
+          | while IFS= read -r workflow_root; do
+              [ -n "$workflow_root" ] || continue
+              # Close step/control beads first; bd will refuse a root that is
+              # still blocked by open workflow children.
+              for _ in 1 2 3 4 5; do
+                step_ids=$(gc bd list \
+                  --metadata-field "gc.root_bead_id=$workflow_root" \
+                  --status=open,in_progress \
+                  --json --limit=0 2>/dev/null \
+                  | jq -r --arg root "$workflow_root" '.[] | select(.id != $root) | .id' || true)
+                [ -n "$step_ids" ] || break
+                closed_any=0
+                for step_id in $step_ids; do
+                  [ -n "$step_id" ] || continue
+                  if gc bd close "$step_id" --reason "$handoff_reason; closing stale polecat workflow step" >/dev/null 2>&1; then
+                    closed_any=1
+                  fi
+                done
+                [ "$closed_any" = "0" ] && break
+              done
+              if gc bd close "$workflow_root" --reason "$handoff_reason; closing stale polecat workflow root" >/dev/null 2>&1; then
+                echo "Closed stale mol-polecat-work workflow $workflow_root for $handoff_work."
+              else
+                echo "Could not close stale mol-polecat-work workflow $workflow_root for $handoff_work; continuing handoff."
+              fi
+            done
+      done
+  return 0
 }
 
 pr_lookup_missing() {
@@ -680,7 +732,7 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
 fi
 ```
 
-**If MERGE_STRATEGY = "direct":**
+**If MERGE_STRATEGY = "direct" (default):**
 
 **0. Refuse a 0-diff branch (false-completion guard):**
 
@@ -733,7 +785,8 @@ gc bd update "$WORK" \
   --set-metadata merged_sha="$MERGED_SHA" \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason && \
-gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"
+gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT" && \
+close_polecat_workflow_for_handoff "$WORK" "Refinery direct handoff merged to $TARGET at $MERGED_SHORT"
 ```
 
 If the script exits non-zero: STOP. Debug and retry. Do NOT write merge
@@ -752,7 +805,7 @@ git branch -d temp || git branch -D temp || true
 ```
 If delete_merged_branches = "true": `git push origin --delete $BRANCH`
 
-**If MERGE_STRATEGY = "mr" (default):**
+**If MERGE_STRATEGY = "mr":**
 
 Refinery does NOT land the branch directly. Instead it publishes a pull
 request and treats PR creation as the terminal handoff for this work bead.
@@ -983,7 +1036,8 @@ gc bd update $WORK \
   --set-metadata pr_number="$PR_NUMBER" \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason && \
-gc bd close $WORK --reason "Pull request ready: $PR_URL"
+gc bd close $WORK --reason "Pull request ready: $PR_URL" && \
+close_polecat_workflow_for_handoff "$WORK" "Refinery PR handoff ready: $PR_URL"
 ```
 
 **5. Cleanup:**
