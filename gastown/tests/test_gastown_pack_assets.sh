@@ -169,6 +169,169 @@ if verify >= metadata:
 PY
 }
 
+test_refinery_closes_attached_polecat_workflows_on_terminal_handoff() {
+    local formula direct_block mr_block prompt
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    prompt="$GASTOWN/agents/refinery/prompt.template.md"
+
+    grep -F 'close_polecat_workflow_for_handoff()' "$formula" >/dev/null ||
+        fail "refinery should define a terminal handoff cleanup helper"
+    grep -F 'bd show "$handoff_work" --refs --json' "$formula" >/dev/null ||
+        fail "refinery cleanup should discover synthetic tracking convoys from work bead refs"
+    grep -F 'gc.input_convoy_id=$input_convoy' "$formula" >/dev/null ||
+        fail "refinery cleanup should find graph.v2 roots by input convoy"
+    grep -F 'gc.root_bead_id=$workflow_root' "$formula" >/dev/null ||
+        fail "refinery cleanup should close workflow steps before the root"
+    grep -F 'mol-polecat-work' "$formula" >/dev/null ||
+        fail "refinery cleanup should be scoped to mol-polecat-work roots"
+
+    direct_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "direct"')
+end = text.index('**If MERGE_STRATEGY = "mr"')
+print(text[start:end])
+PY
+)
+    mr_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "mr"')
+end = text.index('**If MERGE_STRATEGY = "local"')
+print(text[start:end])
+PY
+)
+
+    [[ "$direct_block" == *'close_polecat_workflow_for_handoff "$WORK" "Refinery direct handoff merged to $TARGET at $MERGED_SHORT"'* ]] ||
+        fail "direct handoff should close attached polecat workflows after closing the work bead"
+    [[ "$mr_block" == *'close_polecat_workflow_for_handoff "$WORK" "Refinery PR handoff ready: $PR_URL"'* ]] ||
+        fail "PR handoff should close attached polecat workflows after closing the work bead"
+    grep -F 'still-live `mol-polecat-work` graph.v2 workflow' "$prompt" >/dev/null ||
+        fail "refinery prompt should document terminal cleanup of attached polecat workflows"
+}
+
+test_polecat_exits_cleanly_when_work_is_already_shipped() {
+    local formula prompt
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+
+    grep -F 'WORK_OUTCOME=$(printf' "$formula" >/dev/null ||
+        fail "polecat should inspect work outcome before creating/reusing a worktree"
+    grep -F 'gc.work_outcome' "$formula" >/dev/null ||
+        fail "polecat should specifically recognize gc.work_outcome=shipped"
+    grep -F 'Work bead $WORK_BEAD_ID already shipped; closing stale polecat workflow step' "$formula" >/dev/null ||
+        fail "polecat should close stale workflow steps when work is already shipped"
+    grep -F 'Work bead $WORK_BEAD_ID already shipped; closing stale polecat workflow root' "$formula" >/dev/null ||
+        fail "polecat should close its stale workflow root when work is already shipped"
+    grep -F 'gc runtime drain-ack' "$formula" >/dev/null ||
+        fail "polecat already-shipped path should drain cleanly"
+    grep -F 'already closed with' "$prompt" >/dev/null ||
+        fail "polecat prompt should document the already-shipped clean exit"
+}
+
+test_polecat_enforces_ownership_and_host_safety() {
+    local formula prompt witness gate tmp
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    prompt="$GASTOWN/agents/polecat/prompt.template.md"
+    witness="$GASTOWN/agents/witness/prompt.template.md"
+
+    parse_toml "$formula"
+    # load-context, workspace-setup, self-review, submit-and-exit each carry the gate.
+    [[ $(grep -c '# BEGIN ownership-gate' "$formula") -eq 4 ]] ||
+        fail "ownership gate should be in load-context, workspace-setup, self-review and submit-and-exit"
+    grep -F 'id = "load-context"' "$formula" >/dev/null ||
+        fail "polecat formula should override load-context with the ownership gate"
+    grep -F 'Mail can describe work but never grants it' "$formula" >/dev/null ||
+        fail "load-context should not treat mail as authority to resume"
+    grep -F 'One Polecat Per Bead' "$prompt" >/dev/null ||
+        fail "polecat prompt should document ownership re-checks"
+    grep -F 'Host Safety' "$prompt" >/dev/null ||
+        fail "polecat prompt should have a Host Safety section"
+    grep -F 'Host Safety' "$witness" >/dev/null ||
+        fail "witness prompt should have a Host Safety section"
+    grep -F 'brew services' "$prompt" >/dev/null ||
+        fail "host safety should forbid package/service manager commands"
+
+    # Simulate the gate with a stub gc against varied bead states.
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+    python3 - "$formula" "$tmp" <<'PY'
+import sys, tomllib
+data = tomllib.load(open(sys.argv[1], "rb"))
+for step in data["steps"]:
+    body = step["description"]
+    if "# BEGIN ownership-gate" not in body:
+        continue
+    start = body.index("# BEGIN ownership-gate")
+    end = body.index("# END ownership-gate")
+    open(f"{sys.argv[2]}/gate-{step['id']}.sh", "w").write(
+        body[start:end].replace("{{convoy_id}}", "cv-1"))
+PY
+    cat >"$tmp/gc" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+    "convoy status") echo '{"children":[{"id":"wb-1"}]}' ;;
+    "bd show") cat "$STUB_WORK" ;;
+    "bd list")
+        case "$*" in
+            *gc.kind=workflow*) cat "$STUB_ROOTS" ;;
+            *gc.root_bead_id=*) cat "$STUB_STEPS" ;;
+        esac ;;
+    "runtime drain-ack") echo drained >>"$STUB_LOG" ;;
+esac
+STUB
+    chmod +x "$tmp/gc"
+
+    # gate step work-assignee work-status work-outcome roots-json steps-json
+    run_gate() {
+        printf '[{"assignee":"%s","status":"%s","metadata":{"gc.work_outcome":"%s"}}]' \
+            "$2" "$3" "$4" >"$tmp/work.json"
+        printf '%s' "$5" >"$tmp/roots.json"
+        printf '%s' "$6" >"$tmp/steps.json"
+        : >"$tmp/log"
+        env -i PATH="$tmp:$PATH" BEADS_ACTOR=rig/gastown.me GC_AGENT=rig/gastown.me \
+            STUB_WORK="$tmp/work.json" STUB_ROOTS="$tmp/roots.json" \
+            STUB_STEPS="$tmp/steps.json" STUB_LOG="$tmp/log" \
+            bash "$tmp/gate-$1.sh" >/dev/null 2>&1
+    }
+    local open_root='[{"id":"r1","metadata":{"gc.formula_name":"mol-polecat-work"}}]'
+    local step_me='[{"assignee":"rig/gastown.me","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
+    local step_other='[{"assignee":"rig/gastown.other","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
+    local step_none='[{"assignee":"","metadata":{"gc.step_id":"mol-polecat-work.workspace-setup"}}]'
+
+    # Live shape: work bead unassigned, current step assigned to this session -> pass.
+    run_gate workspace-setup "" open "" "$open_root" "$step_me" ||
+        fail "gate should pass: work bead unassigned, current step assigned to this session"
+    # Missing optional fields are not a mismatch.
+    run_gate workspace-setup "" open "" "$open_root" "$step_none" ||
+        fail "gate should pass when the current step is not yet assigned"
+    run_gate workspace-setup "" open "" "$open_root" '[]' ||
+        fail "gate should pass when the step bead cannot be found"
+    run_gate load-context "rig/gastown.me" in_progress "" "$open_root" "$step_me" ||
+        fail "gate should pass when the work bead is assigned to this session"
+    # Genuine mismatches stop and drain.
+    if run_gate workspace-setup "" open "" "$open_root" "$step_other"; then
+        fail "gate should stop when the current step is assigned to another polecat"
+    fi
+    grep -F drained "$tmp/log" >/dev/null || fail "gate should drain-ack when ownership is lost"
+    if run_gate workspace-setup "" open "" '[]' "$step_me"; then
+        fail "gate should stop when the workflow root is closed"
+    fi
+    if run_gate workspace-setup "rig/gastown.other" open "" "$open_root" "$step_me"; then
+        fail "gate should stop when the work bead is assigned to a different polecat"
+    fi
+    if run_gate self-review "" closed "shipped" "$open_root" "$step_me"; then
+        fail "gate should stop self-review on a shipped work bead"
+    fi
+    if run_gate load-context "" closed "" "$open_root" "$step_me"; then
+        fail "gate should stop on a closed work bead that was not shipped"
+    fi
+    # load-context and workspace-setup let a shipped bead through to the stale-workflow cleanup.
+    run_gate workspace-setup "" closed "shipped" '[]' "$step_me" ||
+        fail "workspace-setup gate should defer shipped beads to stale-workflow cleanup"
+}
+
 test_refinery_merge_strategy_defaults_to_pr() {
     local formula strategy_block
     formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -215,6 +378,10 @@ test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_refinery_closes_attached_polecat_workflows_on_terminal_handoff
+test_polecat_exits_cleanly_when_work_is_already_shipped
+
+test_polecat_enforces_ownership_and_host_safety
 test_refinery_merge_strategy_defaults_to_pr
 
 echo "gastown pack asset tests passed"
