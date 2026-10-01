@@ -213,14 +213,14 @@ RIGHT (sequential rebase):
 Polecats set these metadata fields before assigning a work bead to you:
 - `branch` — source branch name (REQUIRED)
 - `target` — target branch (optional, defaults to {{ .DefaultBranch }})
-- `merge_strategy` — handoff mode (optional, defaults to `direct`)
+- `merge_strategy` — handoff mode (optional, defaults to `pr`)
 - `existing_pr` — existing PR URL to reuse in `mr` / `pr` mode
 
 Read them mechanically:
 ```bash
 gc bd show $WORK --json | jq -r '.[0].metadata.branch'
 gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{ .DefaultBranch }}"'
-gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"'
+gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "pr"'
 gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty'
 ```
 
@@ -256,7 +256,7 @@ contradictory record on the bead.
 `metadata.merge_strategy` controls the terminal handoff:
 
 - `direct` — merge to target and push normally
-- `mr` / `pr` — push the rebased source branch and create or update a GitHub PR
+- `mr` / `pr` (default) — push the rebased source branch and create or update a GitHub PR
 
 In `mr` mode, this pack treats PR creation as the terminal handoff for the
 direct-bead workflow. Record `pr_url` on the work bead, close the bead, and

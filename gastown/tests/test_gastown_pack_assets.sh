@@ -169,11 +169,52 @@ if verify >= metadata:
 PY
 }
 
+test_refinery_merge_strategy_defaults_to_pr() {
+    local formula strategy_block
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+
+    # The jq read must not fall back to "direct"; the default lives in shell
+    # where an unset merge_strategy can be detected and logged before use.
+    ! grep -F '.[0].metadata.merge_strategy // "direct"' "$formula" >/dev/null ||
+        fail "refinery must not fall back to merge_strategy=direct"
+    strategy_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index(".[0].metadata.merge_strategy // empty")
+end = text.index('if [ "$MERGE_STRATEGY" = "pr" ]')
+print(text[start:end])
+PY
+)
+    printf '%s\n' "$strategy_block" | grep -F 'metadata.merge_strategy // empty' >/dev/null ||
+        fail "refinery must read merge_strategy without a jq default so an unset value is detectable"
+    printf '%s\n' "$strategy_block" | grep -F 'MERGE_STRATEGY="pr"' >/dev/null ||
+        fail "a missing merge_strategy must default to pr, not direct"
+    printf '%s\n' "$strategy_block" | grep -F 'No metadata.merge_strategy' >/dev/null ||
+        fail "the pr default must be logged when the fallback is used"
+
+    # The pr default flows into the pull-request handoff path.
+    grep -F 'if [ "$MERGE_STRATEGY" = "pr" ]; then' "$formula" >/dev/null ||
+        fail "refinery must normalize merge_strategy=pr to the mr handoff path"
+    grep -F '**If MERGE_STRATEGY = "mr" (default):**' "$formula" >/dev/null ||
+        fail "the mr handoff must be documented as the default strategy"
+    ! grep -F '**If MERGE_STRATEGY = "direct" (default):**' "$formula" >/dev/null ||
+        fail "direct merge must no longer be documented as the default strategy"
+
+    # Explicit strategies keep working.
+    grep -F '**If MERGE_STRATEGY = "direct":**' "$formula" >/dev/null ||
+        fail "the explicit direct merge path must remain available"
+    grep -F '**If MERGE_STRATEGY = "local":**' "$formula" >/dev/null ||
+        fail "the explicit local merge path must remain available"
+
+    parse_toml "$formula"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_refinery_merge_strategy_defaults_to_pr
 
 echo "gastown pack asset tests passed"
