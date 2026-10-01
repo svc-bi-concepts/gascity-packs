@@ -20,8 +20,9 @@ the work bead and assigns it to the refinery. On rejection, the
 refinery puts the bead back in the pool with rejection metadata.
 
 Merge strategy is per-work-bead metadata:
-- `direct` (default): fast-forward merge to target and push
-- `mr` / `pr`: publish a GitHub pull request instead of landing directly
+- `mr` / `pr` (default): publish a GitHub pull request instead of landing
+  directly
+- `direct`: fast-forward merge to target and push
 
 In `mr` mode, refinery treats PR publication as the terminal handoff for
 the direct-bead workflow: it records the PR URL on the work bead and
@@ -393,7 +394,11 @@ Read the merge target and merge strategy from the work bead metadata:
 ```bash
 BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
+MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // empty')
+if [ -z "$MERGE_STRATEGY" ]; then
+  MERGE_STRATEGY="pr"
+  echo "No metadata.merge_strategy on $WORK; defaulting to merge_strategy=pr (pull-request handoff)."
+fi
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
 ORIGIN_REPO_ERROR=""
 if command -v gh >/dev/null 2>&1; then
@@ -675,7 +680,7 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
 fi
 ```
 
-**If MERGE_STRATEGY = "direct" (default):**
+**If MERGE_STRATEGY = "direct":**
 
 **0. Refuse a 0-diff branch (false-completion guard):**
 
@@ -747,7 +752,7 @@ git branch -d temp || git branch -D temp || true
 ```
 If delete_merged_branches = "true": `git push origin --delete $BRANCH`
 
-**If MERGE_STRATEGY = "mr":**
+**If MERGE_STRATEGY = "mr" (default):**
 
 Refinery does NOT land the branch directly. Instead it publishes a pull
 request and treats PR creation as the terminal handoff for this work bead.
