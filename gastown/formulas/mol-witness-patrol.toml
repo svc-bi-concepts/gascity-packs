@@ -178,14 +178,24 @@ a NEW session with a different ID — the old one never comes back.
    may be a session bead ID, session name, alias, concrete agent name, or
    configured named identity.
 
-   Two schema facts this recipe depends on (verified live, gc-3tn8g):
-   - `gc session list --json` returns an OBJECT `{sessions:[...], ...}`, not
-     a top-level array — iterate `.sessions[]`, never the top level (the
-     top-level values include booleans, so `$x.id` on them errors).
-   - Session fields are lowercase snake_case: `id / name / session_name /
-     alias / agent_name / state / closed`. Key the map on `id`, `name`,
-     `session_name`, `alias`, and `agent_name` — the exact identifier forms
-     an assignee may take.
+   Schema facts this recipe depends on (re-verified live, 2026-10-02):
+   - `gc session list --json` returns an OBJECT
+     `{_cache_age_s, sessions:[...]}`, not a top-level array — iterate
+     `.sessions[]`, never the top level (the top-level values include
+     booleans, so `$x.id` on them errors).
+   - Session fields are lowercase snake_case: `id / session_name / alias /
+     template / state` (plus attached, created_at, last_active, last_output,
+     reason, running, title, work_dir). There is NO `name`, `agent_name`,
+     or `closed` field anymore. Key the map on `id`, `session_name`,
+     `alias`, and `template` — the exact identifier forms an assignee may
+     take — and derive terminal state from `state` (`closed`/`stopped` =>
+     closed).
+   - Treat the session-bead blob as untrusted: it may come back empty, as
+     an object wrapper, with stringified metadata, or prefixed by a
+     non-JSON banner line. Any jq error zeroes the whole map and disarms
+     orphan recovery for the cycle (the recruiter-hub incident: empty map
+     built from 13 live sessions), so the bead merge must skip malformed
+     input instead of failing the build.
 
    Stream both JSON blobs through temp files, never `--argjson` on argv: on a
    busy city the session `command` fields are large and overflow ARG_MAX
@@ -195,19 +205,22 @@ a NEW session with a different ID — the old one never comes back.
    gc session list --state=all --json > "$SESSIONS_FILE"
    gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE"
 
-   LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
+   LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --rawfile session_beads "$SESSION_BEADS_FILE" '
      def add($m; $key; $state; $closed):
-       if (($key // "") | length) == 0 then $m
+       if (($key // "") | type) != "string" or (($key // "") | length) == 0 then $m
        else $m + {($key): (if $closed then "closed" else ($state // "") end)}
        end;
+     def session_closed($state): $state == "closed" or $state == "stopped";
      (reduce ($sessions[0].sessions // [])[] as $s ({};
-         add(.; $s.id;         $s.state; ($s.closed // false))
-       | add(.; $s.name;       $s.state; ($s.closed // false))
-       | add(.; $s.session_name; $s.state; ($s.closed // false))
-       | add(.; $s.alias;      $s.state; ($s.closed // false))
-       | add(.; $s.agent_name; $s.state; ($s.closed // false))
+         add(.; $s.id;          $s.state; session_closed($s.state))
+       | add(.; $s.session_name; $s.state; session_closed($s.state))
+       | add(.; $s.alias;       $s.state; session_closed($s.state))
+       | add(.; $s.template;    $s.state; session_closed($s.state))
      )) as $from_sessions
-     | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
+     | reduce ($session_beads | fromjson? // null
+         | if type == "array" then . else [] end
+         | .[] | select(type == "object")
+         | select((.metadata? // null) | type == "object")) as $b ($from_sessions;
          add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
 
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
@@ -215,15 +228,17 @@ a NEW session with a different ID — the old one never comes back.
    rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
    ```
 
-   **Fail safe — never orphan on an empty map.** If the map is empty while
-   sessions exist, the schema has drifted again (the exact failure in
-   gc-3tn8g). An empty map resolves every assignee to `absent` and would
-   false-orphan live agents. ABORT recovery this cycle — do NOT classify any
-   bead as orphaned — escalate, then continue to `check-refinery`:
+   **Fail safe — never orphan on an empty map.** A healthy map is NEVER
+   empty: it always contains at least the witness's own session. If the map
+   is empty, the schema drifted again (the exact failure in gc-3tn8g) or a
+   blob capture was malformed. An empty map resolves every assignee to
+   `absent` and would false-orphan live agents. ABORT recovery this cycle —
+   do NOT classify any bead as orphaned — escalate, then continue to
+   `check-refinery`:
    ```bash
-   if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
+   if [ "${MAP_COUNT:-0}" -eq 0 ]; then
      echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
-     gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — empty liveness map" -m "Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
+     gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — empty liveness map" -m "Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g) or the session-bead blob was malformed; skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
      # Skip the rest of this step; proceed to check-refinery.
    fi
    ```

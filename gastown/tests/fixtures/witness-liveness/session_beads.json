@@ -1,0 +1,15 @@
+[
+  {
+    "id": "jbb-sess-001",
+    "title": "session bead: recruiter-hub/gastown.witness",
+    "status": "open",
+    "issue_type": "session",
+    "created_at": "2026-10-02T08:00:00Z",
+    "updated_at": "2026-10-02T15:40:00Z",
+    "metadata": {
+      "gc.kind": "session",
+      "configured_named_identity": "recruiter-hub/gastown.witness",
+      "state": "active"
+    }
+  }
+]
