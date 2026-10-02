@@ -78,13 +78,13 @@ test_map_resolves_every_assignee_form() {
     [[ "$(resolve "gc__implementation-worker-gp-wisp-aa11bb22")" == "active" ]] ||
         fail "session name form gc__<role>-gp-wisp-xxxx did not resolve to active"
     # Alias form
-    [[ "$(resolve "recruiter-hub/gastown.polecat-1")" == "closed" ]] ||
+    [[ "$(resolve "rig-a/gastown.polecat-1")" == "closed" ]] ||
         fail "alias form did not resolve (stopped session must derive closed)"
     # Template route form (no alias on the session)
-    [[ "$(resolve "recruiter-hub/gc.implementation-worker")" == "active" ]] ||
+    [[ "$(resolve "rig-a/gc.implementation-worker")" == "active" ]] ||
         fail "template route form did not resolve to active"
     # Session-bead configured_named_identity (no session side entry needed)
-    [[ "$(resolve "recruiter-hub/gastown.witness")" == "active" ]] ||
+    [[ "$(resolve "rig-a/gastown.witness")" == "active" ]] ||
         fail "configured_named_identity form did not resolve to active"
     # Terminal state derived from state=closed
     [[ "$(resolve "gp-wisp-99aa00bb")" == "closed" ]] ||

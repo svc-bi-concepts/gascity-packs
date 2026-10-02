@@ -193,7 +193,7 @@ a NEW session with a different ID — the old one never comes back.
    - Treat the session-bead blob as untrusted: it may come back empty, as
      an object wrapper, with stringified metadata, or prefixed by a
      non-JSON banner line. Any jq error zeroes the whole map and disarms
-     orphan recovery for the cycle (the recruiter-hub incident: empty map
+     orphan recovery for the cycle (the rig-a incident: empty map
      built from 13 live sessions), so the bead merge must skip malformed
      input instead of failing the build.
 

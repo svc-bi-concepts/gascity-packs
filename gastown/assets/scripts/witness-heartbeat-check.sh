@@ -15,8 +15,10 @@
 # (active / awake / asleep / running) it takes the NEWER of `last_active` and
 # `last_nudge_delivered_at` as the heartbeat and compares its age against
 # $GASTOWN_WITNESS_STALE_MIN. Sessions the controller or an operator owns
-# (creating / drained / draining / suspended / quarantined / closed) are the
-# controller's business and are skipped.
+# (creating / start-pending / drained / draining / suspended / quarantined /
+# stopped / closed) are the controller's business and are skipped. Terminal
+# sessions are derived from `state` — the current `gc session list --json`
+# schema no longer exposes a `closed` field (gc-3tn8g).
 #
 # Output: one TSV row per checked witness on stdout, column header on stderr.
 #
@@ -101,13 +103,17 @@ NOW=$(date -u +%s)
 #
 # GNU `date -d` first, BSD `date -j -f` second: the fleet includes macOS.
 # Fractional seconds are stripped because `gc` emits them and BSD `date -f`
-# cannot parse them.
+# cannot parse them. The colon inside a ±hh:mm offset is stripped for the
+# same reason: `gc` emits local-offset stamps such as
+# 2026-10-02T19:12:05+02:00 and BSD strptime %z wants +0200.
 ts_epoch() {
   local ts="$1" norm epoch
   case "$ts" in
     ''|null|0001-*) printf '0'; return 0 ;;
   esac
-  norm=$(printf '%s' "$ts" | sed -E 's/\.[0-9]+(Z|[+-][0-9:]+)?$/\1/')
+  norm=$(printf '%s' "$ts" \
+    | sed -E 's/\.[0-9]+(Z|[+-][0-9:]+)?$/\1/' \
+    | sed -E 's/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
   epoch=$(date -u -d "$norm" +%s 2>/dev/null) \
     || epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%S%z' \
                  "$(printf '%s' "$norm" | sed 's/Z$/+0000/')" +%s 2>/dev/null) \
@@ -136,25 +142,46 @@ if ! TOTAL=$(printf '%s' "$ROSTER" | jq -r "$JQ_SESSIONS sessions_of | length" 2
   exit 2
 fi
 
-# Match the role by exact identifier or dot/slash-delimited suffix across every
-# identity field a session exposes, so an import binding prefix
-# (gastown.witness) or a rig-qualified name (alpha/witness) still matches. Never
-# a bare substring — that would catch unrelated names.
+# Current session schema (gc-3tn8g): id / session_name / alias / template /
+# state / running / attached / created_at / last_active / last_output /
+# reason / title / work_dir. There is no name, agent_name, rig, or closed
+# field anymore, so:
+#   - terminal sessions are excluded by `state` (closed / stopped); the
+#     legacy `closed` boolean is still honored when a pre-drift roster has it.
+#   - `running` is deliberately NOT used to exclude anyone: an asleep witness
+#     — exactly the population this check exists for — reports running=false
+#     while legitimately idle.
+#   - the rig column falls back to the alias/template route prefix
+#     ("alpha/witness" -> "alpha"), tolerating a legacy `rig` field first.
+#
+# Role matching is by exact identifier or dot/slash-delimited suffix across
+# every identity field a session exposes, so an import binding prefix
+# (gastown.witness) or a rig-qualified name (alpha/witness) still matches.
+# Never a bare substring — that would catch unrelated names.
 ROWS=$(printf '%s' "$ROSTER" | jq -r --arg role "$ROLE" "
   $JQ_SESSIONS
   def is_role(\$r):
-    [ (.template // \"\"), (.agent_name // \"\"), (.name // \"\"),
-      (.session_name // \"\"), (.alias // \"\") ]
+    [ (.template // \"\"), (.session_name // \"\"), (.alias // \"\"),
+      (.name // \"\"), (.agent_name // \"\") ]
     | map(select(. != \"\"))
     | any(. == \$r or endswith(\".\" + \$r) or endswith(\"/\" + \$r));
+  def terminal:
+    (.closed // false) or (.state == \"closed\" or .state == \"stopped\");
+  def rig_of:
+    if (.rig // \"\") != \"\" then .rig
+    else ([ (.alias // \"\"), (.template // \"\") ]
+          | map(select(contains(\"/\"))) | .[0] // \"\"
+          | if . == \"\" then \"-\" else split(\"/\")[0] end)
+    end;
   sessions_of
   | .[]
-  | select((.closed // false) | not)
+  | select(terminal | not)
   | select(is_role(\$role))
-  | [ (if (.name // \"\") != \"\" then .name
-       elif (.alias // \"\") != \"\" then .alias
+  | [ (if (.alias // \"\") != \"\" then .alias
+       elif (.session_name // \"\") != \"\" then .session_name
+       elif (.name // \"\") != \"\" then .name
        else (.id // \"?\") end),
-      (if (.rig // \"\") != \"\" then .rig else \"-\" end),
+      rig_of,
       (.state // \"\"),
       (if has(\"last_active\") then \"1\" else \"0\" end),
       ([ (.last_active // \"\"), (.last_nudge_delivered_at // \"\") ]
