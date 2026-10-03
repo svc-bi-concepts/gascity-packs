@@ -647,6 +647,158 @@ test_boot_deacon_observation_query_sees_wisps_tier() {
     done
 }
 
+# Duplicate-work guard (gcp-mj2): a mol-polecat-work workflow must never
+# re-implement a bead whose work already shipped — recorded via
+# gc.work_outcome=shipped or a canonical pr_url with an OPEN pull request.
+# A re-slung shipped bead otherwise lands a fresh polecat on a reviewed PR
+# head, and its extra commits invalidate the review. The guard must run
+# before any worktree/branch work and fail closed when the PR state cannot
+# be verified.
+test_polecat_refuses_to_reimplement_shipped_work() {
+    local formula guard_block polecat_prompt
+    formula="$GASTOWN/formulas/mol-polecat-work.toml"
+    polecat_prompt="$GASTOWN/agents/polecat/prompt.template.md"
+
+    guard_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**1b. Refuse work that already shipped')
+end = text.index('Then resolve what `{{base_branch}}` means')
+print(text[start:end])
+PY
+)
+
+    python3 - "$formula" <<'PY' || fail "duplicate-work guard must fire before the handoff marker clear and any worktree work"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+guard = text.index('**1b. Refuse work that already shipped')
+handoff_clear = text.index('--unset-metadata handoff_stage')
+worktree = text.index('git worktree add')
+if not (guard < handoff_clear < worktree):
+    raise SystemExit(1)
+PY
+
+    [[ "$guard_block" == *'.[0].metadata["gc.work_outcome"] // empty'* ]] ||
+        fail "guard must read gc.work_outcome from the work bead metadata"
+    [[ "$guard_block" == *'[ "$WORK_OUTCOME" = "shipped" ]'* ]] ||
+        fail "guard must refuse when gc.work_outcome=shipped"
+    [[ "$guard_block" == *'.[0].metadata.pr_url // empty'* ]] ||
+        fail "guard must read the canonical pr_url from the work bead metadata"
+    [[ "$guard_block" == *'gh pr view "$WORK_PR" --json state'* ]] ||
+        fail "guard must verify the pr_url pull request state"
+    python3 - "$formula" <<'PY' || fail "guard must pass only MERGED/CLOSED PRs and fail closed on unverifiable state"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**1b. Refuse work that already shipped')
+end = text.index('Then resolve what `{{base_branch}}` means')
+block = text[start:end]
+open_refuse = block.index('OPEN)   REFUSE_REASON=')
+merged_pass = block.index('MERGED|CLOSED) :')
+unverifiable_refuse = block.index("could not be verified")
+refuse_gate = block.index('if [ -n "$REFUSE_REASON" ]')
+# All three case arms must exist and be decided before the refusal gate.
+if not (open_refuse < refuse_gate and merged_pass < refuse_gate and unverifiable_refuse < refuse_gate):
+    raise SystemExit(1)
+PY
+    [[ "$guard_block" == *'--status=in_progress --assignee=""'* ]] ||
+        fail "refusal must park the bead in_progress and unassigned"
+    [[ "$guard_block" == *'halt_reason=duplicate_work_refused'* ]] ||
+        fail "refusal must stamp halt_reason=duplicate_work_refused"
+    [[ "$guard_block" == *'gc workflow delete-source "$WORK_BEAD_ID" --apply'* ]] ||
+        fail "refusal must tear down the duplicate workflow"
+    [[ "$guard_block" == *'gc mail send {{escalation_target}}'* ]] ||
+        fail "refusal must escalate to the configured escalation target"
+    [[ "$guard_block" == *'gc runtime drain-ack'* ]] ||
+        fail "refusal must drain before exiting"
+
+    grep -F 'duplicate_work_refused' "$polecat_prompt" >/dev/null ||
+        fail "polecat prompt should document the duplicate-work refusal"
+    grep -F 'gc.work_outcome=shipped' "$polecat_prompt" >/dev/null ||
+        fail "polecat prompt should document the shipped-outcome refusal"
+}
+
+# Close-on-merge (gcp-mj2): the refinery must never close a work bead whose
+# canonical pr_url points at an open/unmerged pull request — a close while the
+# PR is open asserts landed work that a human has not merged, and re-processed
+# beads were being re-closed while their PR sat in review. The refinery parks
+# such beads in_progress with a note instead; only a verified MERGED PR may
+# close.
+test_refinery_never_closes_open_pr_beads() {
+    local formula find_work_block mr_block refinery_prompt
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    refinery_prompt="$GASTOWN/agents/refinery/prompt.template.md"
+
+    python3 - "$formula" <<'PY' || fail "close-on-merge guard must live in find-work, before the rebase step touches anything"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+find_work = text.index('id = "find-work"')
+guard = text.index('Close-on-merge guard')
+rebase = text.index('id = "rebase"')
+if not (find_work < guard < rebase):
+    raise SystemExit(1)
+PY
+
+    find_work_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**Close-on-merge guard')
+end = text.index('**Do not close this step until you have a work bead with branch metadata.**')
+print(text[start:end])
+PY
+)
+    [[ "$find_work_block" == *'.[0].metadata.pr_url // empty'* ]] ||
+        fail "find-work guard must read the canonical pr_url"
+    [[ "$find_work_block" == *'gh pr view "$PR_URL" --json state'* ]] ||
+        fail "find-work guard must check the PR state"
+    [[ "$find_work_block" == *'"Pull request merged: $PR_URL"'* ]] ||
+        fail "a verified MERGED PR must still close the bead"
+    [[ "$find_work_block" == *'--status=in_progress --assignee=""'* ]] ||
+        fail "an open/unmerged PR must park the bead in_progress and unassigned"
+    [[ "$find_work_block" == *'refinery_hold_reason="pr_open_unmerged"'* ]] ||
+        fail "an open/unmerged PR must stamp refinery_hold_reason=pr_open_unmerged"
+
+    ! grep -F 'gc bd close $WORK --reason "Pull request ready' "$formula" >/dev/null ||
+        fail "mr mode must not close the work bead at PR-publication time"
+
+    mr_block=$(python3 - "$formula" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**4. Record PR metadata and park the bead')
+end = text.index('**5. Cleanup:**')
+print(text[start:end])
+PY
+)
+    [[ "$mr_block" == *'--status=in_progress'* ]] ||
+        fail "mr-mode handoff must park the bead in_progress, not close it"
+    [[ "$mr_block" == *'--assignee=""'* ]] ||
+        fail "mr-mode handoff must clear the refinery assignee when parking"
+    [[ "$mr_block" == *'--set-metadata pr_url="$PR_URL"'* ]] ||
+        fail "mr-mode handoff must still record the canonical pr_url"
+    [[ "$mr_block" == *'refinery_hold_reason="pr_open_unmerged"'* ]] ||
+        fail "mr-mode handoff must stamp refinery_hold_reason=pr_open_unmerged"
+    ! printf '%s\n' "$mr_block" | grep -F 'gc bd close' >/dev/null ||
+        fail "mr-mode handoff must not close the work bead while the PR is open"
+
+    python3 - "$formula" <<'PY' || fail "formula description must document the close-on-merge mr-mode contract"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('Merge strategy is per-work-bead metadata')
+end = text.index('Read each step')
+block = text[start:end]
+required = [
+    "does NOT close the bead while that PR is open and unmerged",
+    "close-on-merge",
+]
+for needle in required:
+    if needle not in block:
+        raise SystemExit(1)
+PY
+    grep -F 'close-on-merge' "$refinery_prompt" >/dev/null ||
+        fail "refinery prompt should document the close-on-merge contract"
+    ! grep -F 'Record `pr_url` on the work bead, close the bead' "$refinery_prompt" >/dev/null ||
+        fail "refinery prompt must not keep the close-at-publication instruction"
+}
+
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
     local formula direct_block
     formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -828,5 +980,7 @@ test_boot_patrol_burn_resolves_current_wisp
 test_boot_deacon_observation_query_sees_wisps_tier
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 test_refinery_rebase_guidance_matches_the_guarded_step
+test_polecat_refuses_to_reimplement_shipped_work
+test_refinery_never_closes_open_pr_beads
 
 echo "gastown pack asset tests passed"

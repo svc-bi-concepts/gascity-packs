@@ -24,8 +24,14 @@ Merge strategy is per-work-bead metadata:
 - `mr` / `pr`: publish a GitHub pull request instead of landing directly
 
 In `mr` mode, refinery treats PR publication as the terminal handoff for
-the direct-bead workflow: it records the PR URL on the work bead and
-closes the bead once the PR is verified.
+the direct-bead workflow: it records the PR URL on the work bead — but it
+does NOT close the bead while that PR is open and unmerged. A verified
+open PR leaves the bead `in_progress`, unassigned, with a hold note; the
+PR lifecycle (whatever merge watcher closes beads on merge in this city)
+closes the source bead when a human merges the PR. Closing at publication
+time re-closes re-processed beads whose PR is still open and contradicts
+that close-on-merge contract. The only `mr`-mode close the refinery still
+performs is for a PR it can verify as already MERGED.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
@@ -206,7 +212,46 @@ If found: read the bead metadata to confirm it has a branch:
 gc bd show $WORK --json | jq '.[0].metadata'
 ```
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
-use {{target_branch}} as default. Note the work bead ID and close this step.
+use {{target_branch}} as default. Note the work bead ID, then run the
+close-on-merge guard below before closing this step.
+
+**Close-on-merge guard — never reprocess a bead whose PR is already live.**
+If the bead carries a canonical `metadata.pr_url`, its work was already
+handed off through a pull request in an earlier pass. Re-processing it
+(rebasing, force-pushing, or re-closing) rewrites a PR head that may be
+in review. Check the PR state BEFORE any rebase or push:
+
+```bash
+PR_URL=$(gc bd show $WORK --json | jq -r '.[0].metadata.pr_url // empty')
+if [ -n "$PR_URL" ]; then
+  PR_STATE=$(gh pr view "$PR_URL" --json state -q '.state' 2>/dev/null)
+  case "$PR_STATE" in
+    MERGED)
+      gc bd update $WORK \
+        --set-metadata merge_result=merged \
+        --set-metadata pr_url="$PR_URL" && \
+      gc bd close $WORK --reason "Pull request merged: $PR_URL"
+      ;;
+    *)
+      # OPEN, CLOSED-unmerged, or the state could not be verified: fail
+      # closed — park the bead untouched and escalate. in_progress with no
+      # assignee is invisible to this patrol's find-work query and to pool
+      # routing, so nothing re-serves it automatically.
+      gc bd update $WORK \
+        --status=in_progress --assignee="" \
+        --set-metadata gc.routed_to="" \
+        --set-metadata refinery_hold_reason="pr_open_unmerged" \
+        --append-notes "Refinery close-on-merge guard: pr_url $PR_URL is ${PR_STATE:-unverifiable}; refused to reprocess or close an unmerged pull request. Bead parked in_progress and unassigned; the merge watcher closes it on merge. If the PR head needs changes, route them through review — not through a new implement workflow."
+      gc mail send mayor/ -s "REFINERY HELD: $WORK awaiting PR merge" -m "Work bead $WORK has pr_url $PR_URL (${PR_STATE:-state unverified}). Parked in_progress, unassigned; branch untouched. It closes when the PR merges."
+      ;;
+  esac
+fi
+```
+
+After a MERGED close or a park, treat this cycle as "no processable work":
+write `IDLE: no work, exiting turn.` and stop. Do not rebase or push a
+bead that was parked by this guard on a later cycle either — the park
+state (in_progress, unassigned) keeps it out of the find-work query.
 
 If NO work found:
 Write exactly:
@@ -984,8 +1029,9 @@ request and treats PR creation as the terminal handoff for this work bead.
 
 The same predicate covers the empty-PR / 0-commit concern: do not publish a
 pull request for a branch that introduces no change vs its merge-base. The
-PR handoff closes the bead, so an empty PR is the same false completion as
-an empty direct merge. A tool error (status 2) is not an empty branch — stop
+PR handoff marks the bead review-ready, so an empty PR is the same false
+completion as an empty direct merge. A tool error (status 2) is not an empty
+branch — stop
 without mutating bead state rather than halt-escalating a healthy branch.
 ```bash
 branch_has_real_change "origin/$TARGET" temp
@@ -1228,25 +1274,36 @@ fi
 ```
 If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
 
-**4. Record PR metadata and close the work bead:**
+**4. Record PR metadata and park the bead (close-on-merge):**
 
-Run as a single chained command so the metadata write cannot be skipped
-when the close-reason already names the PR. Both the `--set-metadata`
-write and the `gc bd close` are required — `pr_url` and `pr_number`
-are the only forensic breadcrumbs tying a closed bead to its pull
-request. `--unset-metadata rejection_reason` clears any stale rejection
-field from an earlier rejected/reworked attempt before the successful
-close.
+The pull request is now verified OPEN with matching head, base, and
+repository. Record the forensic metadata exactly as before — `pr_url` and
+`pr_number` are the only breadcrumbs tying this bead to its pull request —
+but do NOT close the bead while the PR is open and unmerged. Closing here
+asserts "work landed" for a PR that a human has not merged yet, and on
+re-processed beads it re-closes work whose PR is still in review. Instead
+leave the bead `in_progress`, unassigned, with a hold note; the PR
+lifecycle (the merge watcher) closes the bead when the PR merges.
+`--unset-metadata rejection_reason` clears any stale rejection field from
+an earlier rejected/reworked attempt.
 
 ```bash
 gc bd update $WORK \
+  --status=in_progress \
+  --assignee="" \
   --set-metadata merge_result=pull_request \
   --set-metadata pr_url="$PR_URL" \
   --set-metadata pr_number="$PR_NUMBER" \
   --set-metadata merged_target="$TARGET" \
+  --set-metadata refinery_hold_reason="pr_open_unmerged" \
   --unset-metadata rejection_reason && \
-gc bd close $WORK --reason "Pull request ready: $PR_URL"
+gc bd comment $WORK "Pull request ready and verified OPEN: $PR_URL. Bead parked in_progress pending merge (close-on-merge); the merge watcher closes it when the PR merges."
 ```
+
+If the bead was already `in_progress` from your own claim, the update
+above simply clears your assignee — that is what parks it. Never re-close
+it from the patrol: a later merge of the PR, not this wisp, is the only
+valid close for this handoff.
 
 **5. Cleanup:**
 ```bash
@@ -1267,7 +1324,7 @@ The Gastown example refinery supports direct and mr/pr merge strategies only."
 ```
 Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
 
-**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed."""
+**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed — and in mr mode, only when the PR is verified MERGED; an open PR parks the bead in_progress instead of closing it."""
 
 [[steps]]
 id = "patrol-summary"

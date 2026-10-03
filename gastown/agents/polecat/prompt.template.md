@@ -91,7 +91,8 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 | `handoff_stage` | polecat (submit step 5) | Late | `target_recorded` once submit has recorded `target`. This — not `target` — is what says submit ran to completion |
 | `halt_reason` | polecat (base gates) | On halt | Why a fresh attempt stopped (`base_branch_diverged`, `base_branch_missing`). The halt write also clears `handoff_stage` and returns the bead to the polecat pool; workspace-setup clears it again once the base resolves. The witness never hands a bead carrying it to the refinery |
 | `existing_pr` | caller | Before dispatch | Existing PR URL to reuse instead of creating another PR |
-| `pr_url` | refinery | PR handoff | Canonical PR URL recorded after validation |
+| `pr_url` | refinery | PR handoff | Canonical PR URL recorded after validation. Present with an OPEN PR → the duplicate-work guard refuses to re-implement the bead |
+| `gc.work_outcome` | prior handoff | After handoff | `shipped` means the work already landed in a handoff; the duplicate-work guard refuses to re-implement such a bead |
 | `rejection_reason` | refinery (on failure) | On reject | Why the merge was rejected |
 
 **On branch-setup:** You record `work_dir` and `branch` immediately.
@@ -116,6 +117,16 @@ returns the bead to the polecat pool so a fresh attempt can retry once the
 base is reconciled. A halted bead must never reach the refinery, and the
 witness's Step 3a refuses to complete a handoff for a bead carrying
 `halt_reason`.
+
+**On duplicate work (`duplicate_work_refused`):** If the work bead records
+`gc.work_outcome=shipped`, or carries a canonical `pr_url` whose pull request
+is OPEN, the work already shipped — a reviewer may have already reviewed the
+PR head. `workspace-setup` refuses such a bead before touching anything,
+parks it `in_progress` and unassigned, tears down the duplicate workflow, and
+escalates. Never re-implement, re-push, or "resume" such a bead: extra
+commits onto a reviewed PR head invalidate the review. A MERGED or CLOSED
+`pr_url` does not trigger the refusal — follow-up work on a landed bead is
+legitimate. An unverifiable PR state refuses (fail closed).
 
 The formulas are the source of truth for this contract:
 `mol-polecat-work` writes the marker, `mol-refinery-patrol` and

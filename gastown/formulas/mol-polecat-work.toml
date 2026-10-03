@@ -23,6 +23,18 @@ only the refinery verifies merges and closes beads.
 `{{base_branch}}` may come from the work bead's own `metadata.target` or
 be inherited from a parent convoy with `metadata.target` set.
 
+**Duplicate-work guard.** A bead whose work already shipped must never be
+re-implemented. `workspace-setup` refuses the bead — before any worktree,
+branch, or push — when `metadata gc.work_outcome=shipped` is recorded, or
+when `metadata.pr_url` (the canonical PR recorded by the refinery) points
+at an OPEN pull request. The refusal parks the bead `in_progress`,
+unassigned, with a note, tears down the duplicate workflow, and escalates:
+re-implementing shipped work pushes extra commits onto a PR head a reviewer
+may already have reviewed. A MERGED or CLOSED `pr_url` does not trigger the
+refusal — follow-up work on a landed bead is legitimate. When the PR state
+cannot be verified the guard fails closed (refuses), because a lookup error
+is not proof the PR is not open.
+
 ## Variables
 
 | Variable | Source | Description |
@@ -83,12 +95,63 @@ if [ -z "$WORK_BEAD_ID" ]; then
   gc runtime drain-ack
   exit 1
 fi
+```
+
+**1b. Refuse work that already shipped (duplicate-work guard, fail closed):**
+
+Check BEFORE touching the work bead, the worktree, or any branch. External
+dispatchers (CI watchers, auto-dispatch loops, re-slings) can hand this
+workflow a bead whose work is already done — recorded `gc.work_outcome=shipped`,
+or a canonical `pr_url` with an OPEN pull request still in review. A polecat
+that "resumes" such a bead re-implements finished work and pushes extra
+commits onto a PR head that may already have been reviewed, invalidating the
+review. Refuse instead: park the bead, tear down this duplicate workflow, and
+escalate. The source bead may legitimately still be `open` (a close-on-merge
+policy keeps it open until the PR merges), so status is NOT part of the test.
+
+```bash
+WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
+WORK_PR=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.pr_url // empty')
+REFUSE_REASON=""
+if [ "$WORK_OUTCOME" = "shipped" ]; then
+    REFUSE_REASON="gc.work_outcome=shipped (work already handed off)"
+elif [ -n "$WORK_PR" ]; then
+    PR_STATE=""
+    if command -v gh >/dev/null 2>&1; then
+        PR_STATE=$(gh pr view "$WORK_PR" --json state -q '.state' 2>/dev/null)
+    fi
+    case "$PR_STATE" in
+        OPEN)   REFUSE_REASON="open pull request $WORK_PR is in review" ;;
+        MERGED|CLOSED) : ;;  # landed or dead: follow-up work is legitimate
+        *)      REFUSE_REASON="pull request state for $WORK_PR could not be verified (lookup returned '${PR_STATE:-nothing}')" ;;
+    esac
+fi
+if [ -n "$REFUSE_REASON" ]; then
+    echo "DUPLICATE-WORK GUARD: refusing to re-implement $WORK_BEAD_ID ($REFUSE_REASON)."
+    # Tear down the duplicate workflow first: closing it can cascade onto the
+    # source bead, so re-open the source, then park it in one final write.
+    gc workflow delete-source "$WORK_BEAD_ID" --apply || \
+        echo "No live workflow remained for $WORK_BEAD_ID (pool-routed pickup); nothing torn down."
+    gc workflow reopen-source "$WORK_BEAD_ID" || true
+    gc bd update "$WORK_BEAD_ID" \
+        --status=in_progress --assignee="" \
+        --set-metadata gc.routed_to="" \
+        --set-metadata halt_reason=duplicate_work_refused \
+        --append-notes "Duplicate-work guard: mol-polecat-work refused to re-implement this bead ($REFUSE_REASON). Existing branch and pull request untouched; teardown of the duplicate workflow done. Needs a coordinator decision (clear the shipped/open-PR state deliberately, never by re-implementing)."
+    gc mail send {{escalation_target}} -s "DUPLICATE-WORK REFUSED: $WORK_BEAD_ID" -m "mol-polecat-work refused to re-implement $WORK_BEAD_ID: $REFUSE_REASON.
+The bead is parked in_progress and unassigned with halt_reason=duplicate_work_refused; the existing branch and pull request were not touched. If the PR head genuinely needs changes, route them through review/rejection metadata deliberately — do not clear the guard markers to force a re-implement."
+    gc runtime drain-ack
+    exit 0
+fi
 # Clear any stale handoff marker before touching the work. A fresh attempt on
 # this bead means a prior submit-and-exit step 5 no longer describes it, and a
 # leftover marker would let the witness's Step 3a hand un-submitted work to the
 # refinery if this attempt also crashes. Unconditional on purpose: a bead can
 # arrive here carrying the marker with no rejection_reason (witness pool reset,
 # operator re-sling), so clearing only on the rejection path is not enough.
+# (Runs only for beads that passed the duplicate-work guard above — every
+# refusal path has already exited.)
 gc bd update "$WORK_BEAD_ID" --unset-metadata handoff_stage
 ```
 
