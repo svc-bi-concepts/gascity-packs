@@ -371,10 +371,18 @@ test_witness_handoff_recovery_is_guarded_and_fail_closed() {
     # or half-finished tip to a refinery whose only merge gate is tests-pass.
     block=$(awk '/^\*\*Step 3a:/{f=1} /^\*\*Step 3b:/{f=0} f' "$witness")
     # Matched without the leading `if `: the same condition now carries the
-    # STILL_ORPHANED gate in front of it, pinned as a whole line below.
+    # STILL_ORPHANED gate and the halt guard in front of it, pinned as a whole
+    # line below. The halt guard is load-bearing: nothing ever cleared a
+    # stale halt_reason on the resume path that re-reached submit step 5, so
+    # without it a halted bead can still ride a stale handoff_stage marker
+    # straight into the refinery (the halted-bead-to-refinery x3 loop measured in
+    # a production rig).
     printf '%s\n' "$block" |
-        grep -F '[ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then' >/dev/null ||
-        fail "Step 3a must key the handoff on handoff_stage and a branch that is really on origin"
+        grep -F '[ -z "$HALT_REASON" ] && [ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then' >/dev/null ||
+        fail "Step 3a must key the handoff on handoff_stage + branch-on-origin and refuse halted beads"
+    printf '%s\n' "$block" |
+        grep -F "HALT_REASON=\$(echo \"\$META\" | jq -r '.halt_reason // empty')" >/dev/null ||
+        fail "Step 3a must extract halt_reason from the bead metadata it already reads"
     ! printf '%s\n' "$block" | grep -F '[ -n "$BEAD_TARGET" ]' >/dev/null ||
         fail "Step 3a must not treat metadata.target as a completion signal"
     # Both halves of the backstop, in one pin. ls-remote patterns match ref
@@ -448,11 +456,89 @@ test_witness_handoff_recovery_is_guarded_and_fail_closed() {
     local gate
     for gate in \
         'if [ "$STILL_ORPHANED" = "true" ] && [ "$ON_MAIN" = "true" ]; then' \
-        'if [ "$STILL_ORPHANED" = "true" ] && [ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then' \
+        'if [ "$STILL_ORPHANED" = "true" ] && [ -z "$HALT_REASON" ] && [ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then' \
         'if [ "$STILL_ORPHANED" != "true" ]; then'; do
         grep -F -- "$gate" "$witness" >/dev/null ||
             fail "a destructive witness recovery path is not gated on the liveness re-check: $gate"
     done
+}
+
+test_polecat_base_gate_is_fresh_pinned_and_never_halts_on_stale_refs() {
+    local polecat base
+    polecat="$GASTOWN/formulas/mol-polecat-work.toml"
+    base=$(awk '/id = "workspace-setup"/{f=1} /^\[\[steps\]\]/{if (f && !/workspace-setup/) exit} f' "$polecat")
+
+    # The ancestry decision must pin its inputs immediately before reading
+    # them. The step's opening `git fetch --prune origin` is best-effort with
+    # an unchecked exit, and polecat worktrees share one refs database with
+    # the refinery, the witness and the launcher clone -- a fetch that loses a
+    # ref-lock race leaves the remote-tracking base ref stale while the local
+    # base is current, and the old single-shot ancestry check then halted a
+    # mergeable bead for "divergence" one fresh fetch disproves (a production
+    # rig bead halted three times on refs that matched again minutes later).
+    grep -F 'pin_base_ref() {' <<<"$base" >/dev/null ||
+        fail "workspace-setup must pin-fetch the base ref through a named helper before the ancestry decision"
+    grep -F 'git fetch origin "+refs/heads/{{base_branch}}:$BASE_REMOTE"' <<<"$base" >/dev/null ||
+        fail "the base pin must fetch the fully-qualified remote-tracking ref, not rely on the step-opening prune fetch"
+    grep -F 'if ! pin_base_ref; then' <<<"$base" >/dev/null ||
+        fail "a failed base pin must fail closed before any ancestry probe"
+    # Fail-closed arm must not mutate the bead: a halt written off a fetch
+    # failure is a false halt by construction.
+    local pin_stop
+    pin_stop=$(awk '/if ! pin_base_ref; then/{f=1} f && /^[[:space:]]*fi$/{exit} f && /gc[ \t]+bd/{print "mutated"; exit}' <<<"$base")
+    [[ -z "$pin_stop" ]] ||
+        fail "the failed-pin STOP arm must drain without writing bead metadata (found a bead write)"
+
+    # Divergence means MUTUAL divergence. A local base merely ahead of origin
+    # (an upstream sync caught between merge and push) still leaves
+    # $BASE_REMOTE a valid fork point -- branching from it is exactly what the
+    # refinery merges against -- so the old one-directional
+    # `! is-ancestor $BASE_LOCAL $BASE_REMOTE` halt was over-strict and fired
+    # on that transient too.
+    grep -F 'base_diverged() {' <<<"$base" >/dev/null ||
+        fail "the ancestry check must run through a base_diverged helper"
+    local probes
+    probes=$(awk '/^base_diverged\(\) \{/{f=1} f && /^}/{exit} f && /merge-base --is-ancestor/{n++} END{print n+0}' <<<"$base")
+    [[ "$probes" -eq 2 ]] ||
+        fail "base_diverged must probe ancestry in BOTH directions (found $probes probes)"
+
+    # Halting is a routing decision, so it must rest on two fresh reads: the
+    # first divergence observation can itself be a shared-clone ref race, so
+    # re-check once after a second fresh fetch before halting.
+    local diverge_block
+    diverge_block=$(awk '/if base_diverged; then/{f=1} f' <<<"$base" | awk '/if base_diverged; then/{n++} n<2' )
+    grep -F 'pin_base_ref' <<<"$diverge_block" >/dev/null ||
+        fail "the diverged arm must re-pin the base ref before the halt can fire"
+    [[ $(grep -c -F 'if base_diverged; then' <<<"$base") -eq 2 ]] ||
+        fail "the diverged arm must re-check base_diverged once after the fresh re-fetch"
+
+    # A halted bead goes to the POLECAT POOL, never to the refinery: clear the
+    # submit marker (so witness Step 3a cannot complete a refinery handoff for
+    # halted work), stamp halt_reason, and pool-route instead of leaving the
+    # bead in_progress under a session that is about to drain.
+    local halt_writes
+    halt_writes=$(awk '/echo "STOP: local/{f=1} f && /gc runtime drain-ack/{exit} f' <<<"$base")
+    grep -F -- '--status=open --assignee=""' <<<"$halt_writes" >/dev/null ||
+        fail "the base_branch_diverged halt must return the bead to the pool (status=open, assignee="")"
+    grep -F -- '--unset-metadata handoff_stage' <<<"$halt_writes" >/dev/null ||
+        fail "the base_branch_diverged halt must clear handoff_stage so the witness cannot hand halted work to the refinery"
+    grep -F 'gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"' <<<"$halt_writes" >/dev/null ||
+        fail "the base_branch_diverged halt must route to the polecat pool"
+    ! grep -F '{{binding_prefix}}refinery' <<<"$halt_writes" >/dev/null ||
+        fail "the base_branch_diverged halt must never assign the bead to the refinery"
+    local missing_writes
+    missing_writes=$(awk '/echo "STOP: base branch/{f=1} f && /gc runtime drain-ack/{exit} f' <<<"$base")
+    grep -F -- '--status=open --assignee=""' <<<"$missing_writes" >/dev/null ||
+        fail "the base_branch_missing halt must return the bead to the pool too"
+    grep -F -- '--unset-metadata handoff_stage' <<<"$missing_writes" >/dev/null ||
+        fail "the base_branch_missing halt must clear handoff_stage too"
+
+    # Nothing else ever cleared halt_reason, so a base halt from an earlier
+    # attempt used to ride along on the next submit -- mislabelling a healthy
+    # handoff as halted (the exact metadata pair the production loop produced:
+    # halt_reason=base_branch_diverged + handoff_stage=target_recorded).
+    grep -F 'base_branch_diverged|base_branch_missing)' <<<"$base" >/dev/null ||
+        fail "a resolved base must clear a stale base halt_reason from an earlier attempt"
 }
 
 test_boot_wisp_queries_pin_include_infra() {
@@ -736,6 +822,7 @@ test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_witness_wisp_queries_pin_include_infra
 test_witness_handoff_recovery_is_guarded_and_fail_closed
+test_polecat_base_gate_is_fresh_pinned_and_never_halts_on_stale_refs
 test_boot_wisp_queries_pin_include_infra
 test_boot_patrol_burn_resolves_current_wisp
 test_boot_deacon_observation_query_sees_wisps_tier
