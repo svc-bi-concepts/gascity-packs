@@ -101,10 +101,17 @@ substituting a different base, because silently falling back to the
 repo default is how a rig pinned to an integration branch got polecats
 branched off main (gas-e6r).
 
-When the base exists in both places, the local copy must not be ahead of
-origin: a base that has advanced only locally is not the base the
-refinery will merge against, and branching from either side silently
-picks a different fork point. Ancestry-check instead of guessing.
+When the base exists in both places, the two copies must agree on a
+single line of history: if neither is an ancestor of the other (mutual
+divergence), there is no fork point this step and the refinery can both
+mean, so STOP. A local base that is merely ahead of origin (an upstream
+sync caught between its merge and its push) is NOT a halt: this step
+branches from the freshly-pinned remote ref, which is exactly what the
+refinery merges against. Ancestry-check instead of guessing — but check
+MUTUAL divergence, and only on refs that were just fetched: the
+shared-ref race that makes a fresh local base read as diverged from a
+stale remote-tracking ref is a false halt, and false halts reroute real
+work (measured in a production rig).
 
 Both arms name fully-qualified refs. Git resolves `refs/tags/<name>`
 before `refs/heads/<name>`, so a bare branch name lets a same-named tag
@@ -121,33 +128,103 @@ disagree about what "the base" means.
 BASE_REMOTE="refs/remotes/origin/{{base_branch}}"
 BASE_LOCAL="refs/heads/{{base_branch}}"
 WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"
+
+# Pin the base ref RIGHT before deciding on it. The prune fetch at the top of
+# this step is best-effort with an unchecked exit, and this clone shares its
+# refs with every other worktree (polecats, refinery, witness, launcher), so
+# a fetch that loses a ref-lock race to a concurrent fetch or pull leaves
+# $BASE_REMOTE stale while $BASE_LOCAL is current — and an ancestry decision
+# read off that pair halts a mergeable bead for "divergence" that one fresh
+# fetch disproves (measured in a production rig: one bead halted three
+# times on refs that matched again minutes later). Fail closed on a failed
+# pin, exactly like mol-refinery-patrol's guarded ancestry: no probe, no
+# halt, no bead mutation. The next attempt re-runs this block with fresh refs.
+pin_base_ref() {
+    git fetch origin "+refs/heads/{{base_branch}}:$BASE_REMOTE"
+}
+base_diverged() {
+    # Mutual divergence only: neither ref is an ancestor of the other. A
+    # local base merely AHEAD of origin (an upstream sync caught between its
+    # merge and its push) is not a fork-point hazard — this step branches from
+    # $BASE_REMOTE, exactly what the refinery merges against — so it must not
+    # halt. rc 0 = mutually diverged.
+    git merge-base --is-ancestor "$BASE_LOCAL" "$BASE_REMOTE" && return 1
+    git merge-base --is-ancestor "$BASE_REMOTE" "$BASE_LOCAL" && return 1
+    return 0
+}
+
 if git show-ref --verify --quiet "$BASE_REMOTE"; then
-    if git show-ref --verify --quiet "$BASE_LOCAL" && ! git merge-base --is-ancestor "$BASE_LOCAL" "$BASE_REMOTE"; then
-        echo "STOP: local {{base_branch}} is ahead of, or diverged from, the copy on origin."
-        echo "Reconcile or push {{base_branch}} first; do not branch from a stale base."
-        gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_diverged
-        gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local {{base_branch}} is not an ancestor of the copy on origin; $WORK_BEAD_ID cannot pick a fork point. Reconcile the branch."
-        gc runtime drain-ack
-        exit 1
+    if git show-ref --verify --quiet "$BASE_LOCAL"; then
+        if ! pin_base_ref; then
+            echo "STOP: could not refresh $BASE_REMOTE (fetch failed); cannot evaluate base ancestry. No halt recorded — the next attempt re-runs with fresh refs."
+            gc runtime drain-ack
+            exit 1
+        fi
+        if base_diverged; then
+            # Re-check ONCE after a second fresh fetch before halting: the
+            # first failure can itself be a shared-clone ref race, and the
+            # halt reroutes the bead, so it must rest on two fresh reads.
+            if ! pin_base_ref; then
+                echo "STOP: $BASE_REMOTE read as diverged once, but the confirming re-fetch failed; cannot re-check. No halt recorded — the next attempt re-runs with fresh refs."
+                gc runtime drain-ack
+                exit 1
+            fi
+            if base_diverged; then
+                echo "STOP: local {{base_branch}} and origin/{{base_branch}} mutually diverged after two fresh fetches; cannot pick a fork point."
+                echo "Reconcile or push {{base_branch}} first; do not branch from a contested base."
+                # A halted bead goes to the POLECAT POOL, never to the
+                # refinery: clear handoff_stage so the witness's Step 3a
+                # cannot read a stale submit marker off this bead and hand
+                # halted work to a merge lane, and pool-route it so it does
+                # not sit in_progress under a session that is about to die.
+                gc bd update "$WORK_BEAD_ID" \
+                    --status=open --assignee="" \
+                    --unset-metadata handoff_stage \
+                    --set-metadata halt_reason=base_branch_diverged \
+                    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat" \
+                    --append-notes "Halted: local {{base_branch}} and origin/{{base_branch}} mutually diverged even after a fresh re-fetch. Returned to the polecat pool; reconcile the base branch to resume."
+                gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_diverged ($WORK_BEAD_ID)" -m "Local {{base_branch}} and origin/{{base_branch}} mutually diverged across two fresh fetches; $WORK_BEAD_ID cannot pick a fork point. Bead returned to the polecat pool with handoff_stage cleared. Reconcile the branch."
+                gc runtime drain-ack
+                exit 1
+            fi
+        fi
     fi
-    BASE_REF="$BASE_REMOTE"    # preferred: freshly fetched, no local drift
+    BASE_REF="$BASE_REMOTE"    # preferred: freshly pinned, no local drift
 elif git show-ref --verify --quiet "$BASE_LOCAL"; then
     BASE_REF="$BASE_LOCAL"     # local-only base (unpushed integration branch)
     echo "note: base branch {{base_branch}} is local-only — it does not exist on origin"
 else
     echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."
     echo "Fix the rig/bead base configuration; do not substitute a different base."
-    gc bd update "$WORK_BEAD_ID" --set-metadata halt_reason=base_branch_missing
-    gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_missing ($WORK_BEAD_ID)" -m "Base branch {{base_branch}} exists neither on origin nor locally in this clone. $WORK_BEAD_ID cannot start until the rig/bead base configuration is fixed."
+    gc bd update "$WORK_BEAD_ID" \
+        --status=open --assignee="" \
+        --unset-metadata handoff_stage \
+        --set-metadata halt_reason=base_branch_missing \
+        --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat" \
+        --append-notes "Halted: base branch {{base_branch}} exists neither on origin nor locally in this clone. Returned to the polecat pool; fix the rig/bead base configuration to resume."
+    gc mail send "$WITNESS_TARGET" -s "polecat halted: base_branch_missing ($WORK_BEAD_ID)" -m "Base branch {{base_branch}} exists neither on origin nor locally in this clone. $WORK_BEAD_ID cannot start until the rig/bead base configuration is fixed. Bead returned to the polecat pool with handoff_stage cleared."
     gc runtime drain-ack
     exit 1
 fi
+# A base halt from an earlier attempt is stale the moment the base resolves:
+# nothing else ever cleared it, so without this the marker would ride along on
+# the next submit and mislabel a healthy handoff as halted.
+STALE_HALT=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.halt_reason // empty')
+case "$STALE_HALT" in
+    base_branch_diverged|base_branch_missing)
+        gc bd update "$WORK_BEAD_ID" --unset-metadata halt_reason
+        ;;
+esac
 gc bd update "$WORK_BEAD_ID" --set-metadata base_ref="$BASE_REF"
 ```
 
-The STOP arms stamp `halt_reason` and mail the witness on the way out —
-a base misconfiguration needs a human, and an unrecorded exit just loops
-through witness recovery until someone reads session logs.
+The STOP arms stamp `halt_reason`, clear `handoff_stage`, and return the bead
+to the polecat pool while mailing the witness on the way out — a base
+misconfiguration needs a human, an unrecorded exit just loops through witness
+recovery until someone reads session logs, and a halted bead left anywhere
+else (in_progress under a dead polecat, or holding a stale submit marker the
+witness could complete into a refinery handoff) routes halted work into a
+merge lane.
 
 Every later block in this step uses `$BASE_REF` — never assume
 `origin/{{base_branch}}` exists. `$BASE_REF` is a shell variable and

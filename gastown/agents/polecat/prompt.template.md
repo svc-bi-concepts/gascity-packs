@@ -89,6 +89,7 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 | `branch` | polecat (branch-setup) | Early | Source branch name |
 | `target` | caller (sling) or polecat (submit) | Mint-time or Late | Target branch (default: {{ .DefaultBranch }}). `gc sling` accepts it as a mint-time input and nothing ever unsets it, so its presence is **not** a signal that you submitted |
 | `handoff_stage` | polecat (submit step 5) | Late | `target_recorded` once submit has recorded `target`. This — not `target` — is what says submit ran to completion |
+| `halt_reason` | polecat (base gates) | On halt | Why a fresh attempt stopped (`base_branch_diverged`, `base_branch_missing`). The halt write also clears `handoff_stage` and returns the bead to the polecat pool; workspace-setup clears it again once the base resolves. The witness never hands a bead carrying it to the refinery |
 | `existing_pr` | caller | Before dispatch | Existing PR URL to reuse instead of creating another PR |
 | `pr_url` | refinery | PR handoff | Canonical PR URL recorded after validation |
 | `rejection_reason` | refinery (on failure) | On reject | Why the merge was rejected |
@@ -108,6 +109,13 @@ resetting your finished work to the pool.
 polecat picks it up, sees the existing branch and reason, and resumes instead
 of redoing everything. Your own workspace-setup clears `handoff_stage` again
 on every fresh attempt, so a stale marker never survives into new work.
+
+**On halt:** A base-gate halt (`base_branch_diverged`, `base_branch_missing`)
+is not a park state — it clears `handoff_stage`, stamps `halt_reason`, and
+returns the bead to the polecat pool so a fresh attempt can retry once the
+base is reconciled. A halted bead must never reach the refinery, and the
+witness's Step 3a refuses to complete a handoff for a bead carrying
+`halt_reason`.
 
 The formulas are the source of truth for this contract:
 `mol-polecat-work` writes the marker, `mol-refinery-patrol` and
