@@ -128,6 +128,12 @@ commits onto a reviewed PR head invalidate the review. A MERGED or CLOSED
 `pr_url` does not trigger the refusal — follow-up work on a landed bead is
 legitimate. An unverifiable PR state refuses (fail closed).
 
+The one exception is deliberate rework: a bead with a non-empty
+`rejection_reason` (see "On rejection") is exempt from the refusal even though
+it carries `gc.work_outcome=shipped` or an OPEN `pr_url`. Resume its existing
+branch and PR as the rejection flow describes. Once `rejection_reason` is
+unset, the guard applies again to any second workflow on the bead.
+
 The formulas are the source of truth for this contract:
 `mol-polecat-work` writes the marker, `mol-refinery-patrol` and
 workspace-setup clear it, and `mol-witness-patrol` Step 3a is its only reader.

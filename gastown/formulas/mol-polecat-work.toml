@@ -109,12 +109,23 @@ review. Refuse instead: park the bead, tear down this duplicate workflow, and
 escalate. The source bead may legitimately still be `open` (a close-on-merge
 policy keeps it open until the PR merges), so status is NOT part of the test.
 
+One exception: a bead carrying a non-empty `metadata.rejection_reason` was
+deliberately rejected back for rework on its same open PR (review rejection =
+set `rejection_reason`, clear the handoff, re-sling). That is the supported
+reject->fix flow, so the guard does NOT refuse it — regardless of
+`gc.work_outcome=shipped` (a rejected handoff keeps that marker) or an OPEN
+`pr_url`. Step 3 below resumes the same branch and unsets `rejection_reason`;
+once it is unset, a second live workflow on the bead is refused again.
+
 ```bash
 WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
 WORK_OUTCOME=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.work_outcome"] // empty')
 WORK_PR=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.pr_url // empty')
+WORK_REJECTION=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata.rejection_reason // empty')
 REFUSE_REASON=""
-if [ "$WORK_OUTCOME" = "shipped" ]; then
+if [ -n "$WORK_REJECTION" ]; then
+    echo "Duplicate-work guard: $WORK_BEAD_ID carries rejection_reason; deliberate rework of its existing PR, resuming."
+elif [ "$WORK_OUTCOME" = "shipped" ]; then
     REFUSE_REASON="gc.work_outcome=shipped (work already handed off)"
 elif [ -n "$WORK_PR" ]; then
     PR_STATE=""
