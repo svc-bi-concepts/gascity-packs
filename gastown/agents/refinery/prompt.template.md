@@ -267,17 +267,28 @@ contradictory record on the bead.
 - `mr` / `pr` — push the rebased source branch and create or update a GitHub PR
 
 In `mr` mode, this pack treats PR creation as the terminal handoff for the
-direct-bead workflow. Record `pr_url` on the work bead, close the bead, and
-leave the source branch intact for the PR lifecycle.
+direct-bead workflow — but the handoff does NOT close the work bead while
+the PR is open and unmerged (close-on-merge). Record `pr_url` on the work
+bead, park the bead `in_progress` and unassigned with a hold note, and
+leave the source branch intact; the PR lifecycle (the merge watcher)
+closes the source bead when a human merges the PR. Never re-close a bead
+whose `pr_url` is open/unmerged — a re-processed bead stays parked until
+its PR merges. The only `mr`-mode close is a PR verified MERGED.
 
 In `mr` / `pr` mode, if `metadata.existing_pr` is set, reuse that PR URL.
-Do not call `gh pr create` for the work bead. Before pushing or closing
-the bead, verify `gh pr view` reports an open same-repository PR whose
+Do not call `gh pr create` for the work bead. Before pushing or handing
+off, verify `gh pr view` reports an open same-repository PR whose
 `headRefName` equals `metadata.branch` and whose `baseRefName` equals
-`metadata.target`; then record the canonical PR URL as `pr_url` and close
-the bead when the branch has been pushed. If validation fails, record a
+`metadata.target`; then record the canonical PR URL as `pr_url` and park
+the bead once the branch has been pushed. If validation fails, record a
 durable blocked reason on the bead and escalate to mayor instead of
 closing the work.
+
+A bead that arrives at your queue already carrying a canonical `pr_url`
+was handed off in an earlier pass: check the PR state before any rebase
+or push (the `find-work` close-on-merge guard). MERGED → close it as
+merged; still OPEN or unverifiable → park it untouched and escalate.
+Never rebased-force-push a PR head that is in review.
 
 **GitHub-specific today.** `gh pr view`/`gh pr create` require a
 GitHub-hosted origin. Non-GitHub hosts (e.g. Azure DevOps Repos) are
